@@ -121,7 +121,9 @@ values (`hide_parameters`), as both can hold inmate data:
   `book-portal-extension`) and `msg` are required; strict JSON (no NaN or
   Infinity, no number out of range, valid UTF-8) is too. Anything else is
   a 422 whose body names only the fields and error types, never what was
-  sent. `msg` and `exc` are cut to 1024 and 8192 characters; `data` keeps
+  sent. Secrets are taken out of `msg`, `exc`, `logger` and every string
+  in `data` (`ibp/scrub.py`, the digest's patterns); inmate details are
+  kept. `msg` and `exc` are cut to 1024 and 8192 characters; `data` keeps
   at most 20 keys with scalar values (or short lists of them), strings cut
   to 500 characters, and `data.url` and `data.source` without a query
   string or fragment. `host` is the client address from nginx's

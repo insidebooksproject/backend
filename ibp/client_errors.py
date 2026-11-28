@@ -10,6 +10,10 @@ each error here as one event of the shared format without ``ts`` and
   range) and a valid event (else a 422 naming only the fields and error
   types, never what was sent). ``app`` is ``frontend`` or
   ``book-portal-extension``; ``level`` is WARNING, ERROR or CRITICAL.
+- Secrets are taken out of ``msg``, ``exc``, ``logger`` and every string in
+  ``data`` (``ibp/scrub.py``: credentials in URLs, Authorization schemes,
+  ``key=``/``password:`` values, JWTs, long tokens); inmate details are
+  kept.
 - What is kept is bounded: ``msg`` and ``exc`` are cut to
   ``MAX_MSG_CHARS`` and ``MAX_EXC_CHARS``; ``data`` keeps at most
   ``MAX_DATA_KEYS`` keys with scalar values (or short lists of them),
@@ -45,6 +49,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .base import app, config
 from .error_log import WriteFailed, client_error_log, timestamp
+from .scrub import scrub_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +94,7 @@ def clean_scalar(value: Any) -> tuple[bool, Scalar]:
     """``(True, value)`` for a scalar (a string cut short), else ``(False,
     None)``."""
     if isinstance(value, str):
-        return True, truncate(value, MAX_DATA_TEXT_CHARS)
+        return True, truncate(scrub_secrets(value), MAX_DATA_TEXT_CHARS)
     if value is None or isinstance(value, (bool, int, float)):
         return True, value
     return False, None
@@ -112,11 +117,11 @@ def clean_data(data: dict[str, Any]) -> dict[str, Any] | None:
                 continue
             cleaned[key] = [item for _, item in items]
             continue
+        if key in URL_KEYS and isinstance(value, str):
+            value = strip_query(value)
         ok, scalar = clean_scalar(value)
         if not ok:
             continue
-        if key in URL_KEYS and isinstance(scalar, str):
-            scalar = strip_query(scalar)
         cleaned[key] = scalar
     return cleaned or None
 
@@ -142,12 +147,17 @@ class ClientErrorReport(BaseModel):
     @field_validator("msg")
     @classmethod
     def _cut_msg(cls, value: str) -> str:
-        return truncate(value, MAX_MSG_CHARS)
+        return truncate(scrub_secrets(value), MAX_MSG_CHARS)
 
     @field_validator("exc")
     @classmethod
     def _cut_exc(cls, value: str | None) -> str | None:
-        return None if value is None else truncate(value, MAX_EXC_CHARS)
+        return None if value is None else truncate(scrub_secrets(value), MAX_EXC_CHARS)
+
+    @field_validator("logger")
+    @classmethod
+    def _scrub_logger(cls, value: str | None) -> str | None:
+        return None if value is None else scrub_secrets(value)
 
     @field_validator("data")
     @classmethod

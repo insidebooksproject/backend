@@ -668,3 +668,38 @@ def test_client_log_file_is_0640(client, log_dir):
     path = log_dir / CLIENT_LOG_NAME
     assert stat.S_IMODE(path.stat().st_mode) == 0o640
     assert stat.S_IMODE(log_dir.stat().st_mode) == 0o750
+
+
+def test_secrets_are_scrubbed_before_writing(client, log_dir):
+    """A password in data.detail (quoted, spaces and all), a Bearer token in
+    exc, a key= in a URL and a token in a list are replaced; inmate details
+    are kept."""
+    body = report(
+        msg="GET https://books.example/v1?q=isbn:1&key=AIzaSyFAKE0123456789abcd failed",
+        exc="Error: refused\n  Authorization: Bearer abc.DEF-123456789xyz\n"
+        "    at r (http://ibp-server/assets/index-DkS8f3jK.js:1:2345)",
+        data={
+            "detail": 'login failed: password: "correct horse battery" for SMITH, '
+            "JOHN 01234567 at 2001 Main St",
+            "url": "https://user:hunter2@ibp-server/requests?token=x",
+            "notes": ["fine", "api_key=sk-FAKE-0123456789abcdefghijkl"],
+            "status": 500,
+        },
+    )
+    assert client.post("/client-errors", json=body).status_code == 204
+    (event,) = events(log_dir)
+    assert event["msg"] == ("GET https://books.example/v1?q=isbn:1&key=<secret> failed")
+    assert event["exc"] == (
+        "Error: refused\n  Authorization: Bearer <secret>\n"
+        "    at r (http://ibp-server/assets/index-DkS8f3jK.js:1:2345)"
+    )
+    assert event["data"] == {
+        "detail": "login failed: password: <secret> for SMITH, JOHN 01234567 "
+        "at 2001 Main St",
+        "url": "https://<secret>@ibp-server/requests",
+        "notes": ["fine", "api_key=<secret>"],
+        "status": 500,
+    }
+    text = (log_dir / CLIENT_LOG_NAME).read_text()
+    for secret in ("AIzaSy", "abc.DEF", "horse", "hunter2", "sk-FAKE"):
+        assert secret not in text
