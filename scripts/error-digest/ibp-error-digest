@@ -36,10 +36,9 @@ it is incomplete, seen.json is left as it was, and the exit status is 1.
 Redaction: no ``data`` field (but a browser app's HTTP status), request body
 or raw line is ever copied. Each message, and the exception line of a stack,
 has secrets (a URL's password, Bearer/Basic credentials, key=, token=,
-password=... values, JWTs, long base64 or hex runs) replaced, package and
-request codes reduced to their prefix (TEX-########-#), and e-mail
-addresses, quoted strings, runs of four or more digits, and anything after
-"address", "name" or "inmate" replaced by placeholders. A stack is kept as
+password=... values, JWTs, long base64 or hex runs) and e-mail addresses
+replaced. Inmate names, TDCJ numbers, addresses and package codes are kept
+(largely public, and useful); fingerprints still ignore them. A stack is kept as
 frames only (file:line function; a bundle's minified names left out). The
 raw events stay where they are; each group names one of them (path:line,
 only for a path of plain names, or a journalctl command) to look up on the
@@ -212,7 +211,11 @@ JS_BUNDLE_HASH = re.compile(r"-[A-Za-z0-9_-]{8}(?=\.m?js$)")
 
 
 def redact(text: Any, limit: int = MAX_TEXT) -> str:
-    """``text`` with the inmate data the design names replaced; one line."""
+    """``text`` with secrets and e-mail addresses replaced; one line.
+
+    Inmate names, TDCJ numbers, unit addresses and codes are kept: they are
+    largely public and they help find the cause (decided 2026-11-28).
+    """
     if not isinstance(text, str):
         return ""
     if len(text) > MAX_SCAN:
@@ -227,17 +230,7 @@ def redact(text: Any, limit: int = MAX_TEXT) -> str:
     out = SECRET_PAIR.sub(lambda m: f"{m['key']}{m['sep']}<secret>", out)
     out = JWT.sub("<secret>", out)
     out = TOKEN.sub("<secret>", out)
-    out = CODE.sub(
-        lambda m: f"{m['prefix'].upper()}-{'#' * len(m['id'])}-{'#' * len(m['index'])}",
-        out,
-    )
     out = EMAIL.sub("<email>", out)
-    out = QUOTED.sub("<text>", out)
-    keyword = KEYWORD.search(out)
-    if keyword:
-        rest = out[keyword.end() :]
-        out = out[: keyword.end()] + (" <redacted>" if rest.strip() else "")
-    out = DIGITS.sub("<num>", out)
     out = " ".join(out.split())
     if len(out) > limit:
         out = out[: limit - 3].rstrip() + "..."
@@ -245,8 +238,18 @@ def redact(text: Any, limit: int = MAX_TEXT) -> str:
 
 
 def normalize(redacted: str) -> str:
-    """A redacted message with what varies between occurrences removed."""
-    out = re.sub(r"\b[0-9a-fA-F]{8,}\b", "<hex>", redacted)
+    """A redacted message with what varies between occurrences removed.
+
+    Only for fingerprints: codes, quoted text, whatever follows "address",
+    "name" or "inmate", and numbers, so one error with different inmates
+    or packages stays one group.
+    """
+    out = CODE.sub(lambda m: f"{m['prefix'].upper()}-#-#", redacted)
+    out = QUOTED.sub("<text>", out)
+    keyword = KEYWORD.search(out)
+    if keyword:
+        out = out[: keyword.end()] + (" <x>" if out[keyword.end() :].strip() else "")
+    out = re.sub(r"\b[0-9a-fA-F]{8,}\b", "<hex>", out)
     out = re.sub(r"\d+", "<n>", out)
     out = re.sub(r"#+", "#", out)
     return " ".join(out.split())

@@ -108,9 +108,11 @@ request body or raw line is ever copied. In each message and exception
 line: secrets become `<secret>` (a URL's `user:password@`, `Bearer`/`Basic`
 credentials, the value of `key=`, `token=`, `password:` and the like, JWTs,
 and runs of 24 or more base64/hex characters with letters and digits);
-package and request codes keep only their prefix (`TEX-########-#`), e-mail addresses become `<email>`, quoted
-strings `<text>`, runs of four or more digits `<num>`, and everything after
-a word containing `address`, `name` or `inmate` becomes `<redacted>`. Text
+and e-mail addresses become `<email>`. Inmate names, TDCJ numbers, unit
+addresses, quoted text and package codes are kept: they are largely public
+and help find a cause (jstarr, 2026-11-28). Fingerprints still replace
+codes, quoted text, numbers and what follows `address`, `name` or `inmate`,
+so one error with different inmates stays one group. Text
 is one line, at most 300 characters. Of `.env` only the `IBP_TAG=` line is
 read.
 

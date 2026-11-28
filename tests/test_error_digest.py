@@ -36,14 +36,12 @@ _loader.exec_module(digest)
 NOW = datetime(2026, 11, 26, 15, 0, tzinfo=timezone.utc)
 CT = timezone(timedelta(hours=-6))
 
-# Invented inmate data that must never reach a digest.
+# Invented data that must never reach a digest: an e-mail address in a
+# message, and what is only in a ``data`` field (never copied). Inmate names,
+# numbers and codes in a message are kept (jstarr 2026-11-28).
 SECRETS = [
-    "Jane Q Example",
-    "Example",
     "4521 Fake Street",
     "jane@example.org",
-    "01234567",
-    "TEX-01234567-2",
 ]
 
 PY_TRACE = (
@@ -172,26 +170,18 @@ def groups_by_app(report):
 # Redaction
 
 
+# Inmate details are kept (largely public, and useful; jstarr 2026-11-28):
+# only e-mail addresses and secrets are replaced.
 @pytest.mark.parametrize(
     "text, expected",
     [
-        ("package TEX-01234567-2 failed", "package TEX-########-# failed"),
-        ("fed FED-1234567-10 ok", "fed FED-#######-## ok"),
+        ("package TEX-01234567-2 failed", "package TEX-01234567-2 failed"),
         ("mail jane@example.org bounced", "mail <email> bounced"),
-        (
-            "printer \"BOB\" offline and 'BETTY' too",
-            "printer <text> offline and <text> too",
-        ),
-        ("can't open the printer", "can't open the printer"),
-        (
-            "lookup failed for inmate Jane Q Example",
-            "lookup failed for inmate <redacted>",
-        ),
-        ("bad address: 4521 Fake Street", "bad address <redacted>"),
-        ("unit_name=Hughes is odd", "unit_name <redacted>"),
-        ("tracking 9400111202555842761234 stuck", "tracking <num> stuck"),
+        ("printer \"BOB\" offline and 'BETTY' too", "printer \"BOB\" offline and 'BETTY' too"),
+        ("lookup failed for inmate Jane Q Example", "lookup failed for inmate Jane Q Example"),
+        ("bad address: 4521 Fake Street", "bad address: 4521 Fake Street"),
+        ("tracking 9400111202555842761234 stuck", "tracking 9400111202555842761234 stuck"),
         ("retry 3 of 5 in 120 s", "retry 3 of 5 in 120 s"),
-        ("unterminated 'Jane Example", "unterminated <text>"),
         ("two\nlines\there", "two lines here"),
     ],
 )
@@ -205,8 +195,18 @@ def test_redact_keeps_messages_short_and_ignores_non_text():
     assert digest.redact({"name": "Jane"}) == ""
 
 
-def test_keyword_tail_is_redacted_even_after_a_code():
-    assert digest.redact("TEX-01234567-2 name Jane") == "TEX-########-# name <redacted>"
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        ("package TEX-01234567-2 failed", "package TEX-07654321-0 failed"),
+        ("printer \"BOB\" offline", "printer \"BETTY\" offline"),
+        ("lookup failed for inmate Jane Q Example", "lookup failed for inmate John Doe"),
+        ("bad address: 4521 Fake Street", "bad address: 12 Other Rd"),
+        ("TEX-01234567-2 name Jane", "TEX-00000001-1 name Bob Smith"),
+    ],
+)
+def test_fingerprints_ignore_inmate_details(a, b):
+    assert digest.normalize(digest.redact(a)) == digest.normalize(digest.redact(b))
 
 
 # --------------------------------------------------------------------------
@@ -221,7 +221,7 @@ def test_python_stack_frames_are_short_and_innermost_ibp_frame_found():
         "httpx/_client.py:1100 post",
     ]
     assert stack.type == "httpx.ConnectError"
-    assert stack.message == "host <text> down"
+    assert stack.message == "host 'x' down"
     assert stack.innermost().text() == "shippy/core/easypost.py:88 buy"
     assert "insid" not in " ".join(f.text() for f in stack.frames)
 
@@ -254,7 +254,7 @@ def test_chained_python_traceback_uses_the_last_exception():
     stack = digest.parse_stack(exc)
     assert stack.type == "ValueError"
     assert [f.text() for f in stack.frames] == ["ibp/routes.py:20 get_book"]
-    assert stack.message == "bad value <text>"
+    assert stack.message == "bad value 'Jane'"
 
 
 def test_checkout_paths_with_ibp_in_them_are_not_mistaken_for_ibp_code():
@@ -490,13 +490,15 @@ def test_run_groups_counts_and_describes_each_group(tree):
     assert exc_group["versions"] == ["0.1.0"]
     assert exc_group["exception"] == {
         "type": "httpx.ConnectError",
-        "message": "TEX-########-#",
+        "message": "TEX-01234567-2",
     }
     assert exc_group["frames"][-1] == "httpx/_client.py:1100 post"
     path, line = exc_group["raw_event"].rsplit(":", 1)
     assert path.endswith("IBP_LAPTOP/errors-shippy-gui.jsonl") and line == "1"
     assert msg_group["level"] == "WARNING"
-    assert msg_group["message"] == "lookup failed for inmate <redacted>"
+    assert msg_group["message"] == (
+        "lookup failed for inmate Jane Q Example (01234567), mail <email>"
+    )
     assert msg_group["raw_event"].endswith("errors-shippy-gui.jsonl.1:1")
     # "{not json", "[1, 2, 3]" and the line with no time stamp.
     assert report["unreadable"] == {"IBP_LAPTOP/errors-shippy-gui.jsonl": 3}
@@ -653,7 +655,7 @@ def test_kiosk_station_layout(tree):
     )
     assert apps["print-server"]["hosts"] == {"ibp-bilbo": 1}
     assert apps["ibp-kiosk"]["level"] == "ERROR"
-    assert apps["ibp-kiosk"]["message"] == "tile portal failed for inmate <redacted>"
+    assert apps["ibp-kiosk"]["message"] == "tile portal failed for inmate Jane"
     assert apps["ibp-kiosk-update"]["level"] == "WARNING"
     assert apps["ibp-kiosk-log-upload"]["level"] == "WARNING"
     assert "systemd" not in apps
@@ -937,7 +939,7 @@ def test_pi_journal_and_failed_units(tree):
     apps = groups_by_app(report)
     assert (
         apps["ibp-backup"]["message"]
-        == "ibp-backup.service: Failed with result <text>."
+        == "ibp-backup.service: Failed with result 'exit-code'."
     )
     assert apps["ibp-backup"]["raw_event"].startswith(
         "journalctl -u ibp-backup.service "
