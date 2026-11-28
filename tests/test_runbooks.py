@@ -75,7 +75,11 @@ systemctl() {
     printf 'backup\n' > "$HOME/backups/ibp/data-upgrade.db.zst"
   fi
   if [ "$1" = show ]; then
-    case "${*: -1}" in *.timer) echo "${TIMER_STATE:-inactive}" ;; *) echo "${STATE:-inactive}" ;; esac
+    case "$*" in
+      *UnitFileState*) echo "${TIMER_ENABLED:-enabled}" ;;
+      *.timer) echo "${TIMER_STATE:-inactive}" ;;
+      *) echo "${STATE:-inactive}" ;;
+    esac
   fi
 }
 ibp_sync() {
@@ -160,6 +164,7 @@ def script_for(block: str, root: Path) -> str:
     """``block`` pointed at the sandbox, its placeholders filled in."""
     script = block.replace("~/.local/bin/ibp-shipment-sync --", "ibp_sync --")
     script = script.replace("<checkout of the new tag>", str(root / "checkout"))
+    script = script.replace("<pinned backup>", "~/backups/ibp/data-X.db.zst")
     for placeholder in ("<new tag>", "<before upgrade>"):
         script = script.replace(placeholder, "X")
     for path in ("/srv/ibp", "/etc/systemd/system", "/path/to/migrated.db"):
@@ -202,6 +207,7 @@ def run_block(
 def unique(text: str, root: Path) -> str:
     """``text`` with per-attempt names and the sandbox path made generic."""
     text = re.sub(r"(data|before-rollback)-\d+-\d+", r"\1-UNIQUE", text)
+    text = re.sub(r"(before-[^/\s]+?)-\d{4}-\d\d-\d\d_\d{6}", r"\1-UNIQUE", text)
     return text.replace(str(root), "")
 
 
@@ -211,8 +217,10 @@ def state(root: Path) -> dict[str, str]:
     found = {}
     for path in sorted(root.rglob("*")):
         relative = str(path.relative_to(root))
-        if path.is_file() and "before-rollback-" not in relative:
-            found[unique(relative, root)] = path.read_text()
+        # The pinned backups: one per attempt that got that far.
+        pinned = "backups/ibp-pinned/" in relative
+        if path.is_file() and "before-rollback-" not in relative and not pinned:
+            found[unique(relative, root)] = unique(path.read_text(), root)
     return found
 
 
@@ -514,28 +522,70 @@ def test_upgrade_refuses_a_saved_copy_naming_the_new_tag(tmp_path):
     assert not [s for s in result.steps if "compose" in s or "systemctl stop" in s]
 
 
-@pytest.mark.parametrize("timer, restarted", [("active", True), ("inactive", False)])
-def test_upgrade_stops_the_timer_and_restores_its_state(tmp_path, timer, restarted):
-    """The upgrade stops the timer and holds the run lock while it runs,
-    and starts the timer again at the end only if it was running before,
-    even when that took a re-run (its state is kept from the first)."""
-    block = upgrade_block()
-    root = without_upgrade_save(sandbox(tmp_path))
-    steps = run_block(root, block, env={"TIMER_STATE": timer}).steps
-    assert ("systemctl start ibp-shipment-sync.timer" in steps) is restarted
-    retry = without_upgrade_save(sandbox(tmp_path / "retry"))
-    pull = steps.index("docker compose pull") + 1
-    run_block(retry, block, pull, env={"TIMER_STATE": timer})
-    # The timer is stopped now, so a re-run sees it inactive.
-    again = run_block(retry, block, env={"TIMER_STATE": "inactive"}).steps
-    assert ("systemctl start ibp-shipment-sync.timer" in again) is restarted
-    probe = sandbox(tmp_path / "probe")
-    without_upgrade_save(probe)
-    run_block(probe, block, env={"PROBE": "docker compose pull"})
+DISABLE = "systemctl disable --now ibp-shipment-sync.timer"
+ENABLE = "systemctl enable ibp-shipment-sync.timer"
+START = "systemctl start ibp-shipment-sync.timer"
+HEALTH = "curl -fsS -o /dev/null http://localhost/api/health"
+UPGRADE_ENV = Path("srv/ibp/.env")
+MARKER = Path("srv/ibp/.backup-before-X")
+
+
+def fresh_upgrade(tmp_path: Path, name: str) -> Path:
+    """A sandbox before an upgrade."""
+    return without_upgrade_save(sandbox(tmp_path / name))
+
+
+def upgrade_steps(tmp_path: Path) -> list[str]:
+    """The steps of a clean upgrade."""
+    return run_block(fresh_upgrade(tmp_path, "clean"), upgrade_block()).steps
+
+
+@pytest.mark.parametrize(
+    "enabled, active, put_back",
+    [
+        ("enabled", "active", [ENABLE, START]),
+        ("enabled", "inactive", [ENABLE]),
+        ("disabled", "inactive", []),
+    ],
+)
+def test_upgrade_disables_the_timer_and_puts_it_back_once_healthy(
+    tmp_path, enabled, active, put_back
+):
+    """The timer is disabled (so not even a reboot starts a sync) until the
+    new version is up, healthy and answering; then it is enabled and
+    started only as it was, even when that took a re-run (its state is kept
+    from the first)."""
+    env = {"TIMER_ENABLED": enabled, "TIMER_STATE": active}
+    root = fresh_upgrade(tmp_path, "run")
+    steps = run_block(root, upgrade_block(), env=env).steps
+    assert DISABLE in steps
+    after = steps[steps.index(HEALTH) + 1 :]
+    assert [s for s in after if s in (ENABLE, START)] == put_back
+    assert steps.index("docker compose up -d --wait") < steps.index(HEALTH)
+    # A re-run after a failed pull sees the timer disabled and stopped, but
+    # puts back what the first run recorded.
+    retry = fresh_upgrade(tmp_path, "retry")
+    run_block(retry, upgrade_block(), steps.index("docker compose pull") + 1, env)
+    gone = {"TIMER_ENABLED": "disabled", "TIMER_STATE": "inactive"}
+    again = run_block(retry, upgrade_block(), env=gone).steps
+    assert [s for s in again if s in (ENABLE, START)] == put_back
+    probe = fresh_upgrade(tmp_path, "probe")
+    run_block(probe, upgrade_block(), env={"PROBE": "docker compose pull"})
     assert (tmp_path / "probe" / "probe").read_text() == "refused\n"
 
 
-UPGRADE_ENV = Path("srv/ibp/.env")
+@pytest.mark.parametrize("step", ["docker compose up -d --wait", HEALTH])
+def test_upgrade_leaves_the_timer_disabled_unless_healthy(tmp_path, step):
+    """If the new version doesn't come up healthy, the timer stays disabled
+    and the message says not to start it."""
+    clean = upgrade_steps(tmp_path)
+    root = fresh_upgrade(tmp_path, "failed")
+    result = run_block(root, upgrade_block(), clean.index(step) + 1)
+    assert result.status != 0
+    assert DISABLE in result.steps
+    assert not [s for s in result.steps if s in (ENABLE, START)]
+    assert ".env names X and the shipment timer is disabled" in result.output
+    assert "don't start the timer before the new version is healthy" in result.output
 
 
 @pytest.mark.parametrize(
@@ -549,108 +599,156 @@ UPGRADE_ENV = Path("srv/ibp/.env")
         ("IBP_UID=\nIBP_GID=\n", {}, "1000 -g 1000"),
         # As compose does, the exported environment wins over .env.
         ("IBP_UID=1001\n", {"IBP_UID": "1005", "IBP_GID": ""}, "1005 -g 1000"),
+        # An exported IBP_TAG naming the new tag is fine.
+        ("", {"IBP_TAG": "X"}, "1000 -g 1000"),
     ],
 )
 def test_upgrade_switches_only_after_a_backup(tmp_path, edited, shell, owner):
-    """The edited copy is checked before the timer stops; the backup comes
-    after the drain and the lock, and only then the log owner (from
-    IBP_UID/IBP_GID as compose gets them, else 1000) and the swap of the
-    copy in as .env. The first backup's name is kept and printed."""
+    """The edited copy is checked before the timer is disabled; the backup
+    comes after the drain and the lock, is pinned and named for the
+    rollback, and only then the log owner (from IBP_UID/IBP_GID as compose
+    gets them, else 1000) and the swap of the copy in as .env."""
     env = {"NANO_EXTRA": edited, **shell}
-    root = without_upgrade_save(sandbox(tmp_path))
+    root = fresh_upgrade(tmp_path, "run")
     result = run_block(root, upgrade_block(), env=env)
     assert result.status == 0, result.output
     install = f"install -d -o {owner} -m 0750 /srv/ibp/logs"
     steps = result.steps
     order = [
         "nano .env.next-X",
-        "systemctl stop ibp-shipment-sync.timer",
+        DISABLE,
         "flock -n 9",
         "systemctl start ibp-backup.service",
+        "mkdir -p /home/backups/ibp-pinned",
         install,
         "mv .env.next-X .env",
         "docker compose pull",
-        "docker compose up -d",
+        "docker compose up -d --wait",
+        HEALTH,
+        ENABLE,
     ]
-    assert [steps.index(step) for step in order] == sorted(
-        steps.index(step) for step in order
-    )
+    positions = [steps.index(step) for step in order]
+    assert positions == sorted(positions)
     assert (root / UPGRADE_ENV).read_bytes() == f"IBP_TAG=X\n{edited}".encode()
     assert not (root / "srv" / "ibp" / ".env.next-X").exists()
-    record = root / "srv" / "ibp" / ".backup-before-X"
-    assert record.read_text() == "data-upgrade.db.zst\n"
-    assert "Backup for a rollback: ~/backups/ibp/data-upgrade.db.zst" in result.output
+    pinned = Path((root / MARKER).read_text().strip())
+    assert pinned.parent == root / "home" / "backups" / "ibp-pinned"
+    assert re.fullmatch(r"before-X-\d{4}-\d\d-\d\d_\d{6}\.db\.zst", pinned.name)
+    # A copy, not the rotating backup itself.
+    assert pinned.read_text() == "backup\n"
+    assert (root / "home" / "backups" / "ibp" / "data-upgrade.db.zst").exists()
+    assert f"Backup for a rollback: {pinned}" in result.output
 
 
 @pytest.mark.parametrize(
-    "step",
-    [
-        "systemctl stop ibp-shipment-sync.timer",
-        "flock -n 9",
-        "systemctl start ibp-backup.service",
-    ],
+    "step", [DISABLE, "flock -n 9", "systemctl start ibp-backup.service"]
 )
 def test_upgrade_stopped_before_the_switch_leaves_the_running_version(tmp_path, step):
     """A failed backup (or drain, or lock) leaves .env naming the running
     version, so a reboot runs the old image, and the log owner untouched;
-    the message says so."""
-    clean = run_block(without_upgrade_save(sandbox(tmp_path)), upgrade_block())
-    root = without_upgrade_save(sandbox(tmp_path / "failed"))
-    env = {"NANO_EXTRA": "IBP_UID=1001\n"}
-    result = run_block(root, upgrade_block(), clean.steps.index(step) + 1, env)
+    the message says so and how to resume the timer."""
+    clean = upgrade_steps(tmp_path)
+    root = fresh_upgrade(tmp_path, "failed")
+    env = {"NANO_EXTRA": "IBP_UID=1001\n", "TIMER_STATE": "active"}
+    result = run_block(root, upgrade_block(), clean.index(step) + 1, env)
     assert result.status != 0
     assert (root / UPGRADE_ENV).read_text() == "IBP_TAG=v1.0.0\n"
     assert not [s for s in result.steps if s.startswith(("install -d", "mv .env"))]
     assert not (root / "srv" / "ibp" / "logs").exists()
-    assert ".env and the log owner are unchanged" in result.output
+    assert ".env (still v1.0.0) and the log owner are unchanged" in result.output
+    assert (
+        "resume the timer: sudo systemctl enable ibp-shipment-sync.timer && "
+        "sudo systemctl start ibp-shipment-sync.timer" in result.output
+    )
+
+
+@pytest.mark.parametrize("step", ["install -d", "mv .env.next-X .env"])
+def test_upgrade_stopped_at_the_owner_says_how_to_put_it_back(tmp_path, step):
+    """If setting the log owner or the swap fails, .env is unchanged and the
+    message gives the command to put the old owner back."""
+    clean = upgrade_steps(tmp_path)
+    root = fresh_upgrade(tmp_path, "failed")
+    logs = root / "srv" / "ibp" / "logs"
+    logs.mkdir()
+    old = f"{logs.stat().st_uid}:{logs.stat().st_gid}"
+    at = next(i for i, s in enumerate(clean) if s.startswith(step)) + 1
+    result = run_block(root, upgrade_block(), at)
+    assert result.status != 0
+    assert (root / UPGRADE_ENV).read_text() == "IBP_TAG=v1.0.0\n"
+    output = unique(result.output, root)
+    assert ".env unchanged (still v1.0.0)" in output
+    assert f"put the owner back (sudo chown -R {old} /srv/ibp/logs)" in output
+
+
+def test_upgrade_run_again_after_the_switch_only_finishes(tmp_path):
+    """Once .env names the new tag, a re-run takes no new backup (the
+    marker still names the one from before the swap), doesn't edit, and
+    finishes: pull, start, health, timer."""
+    clean = upgrade_steps(tmp_path)
+    root = fresh_upgrade(tmp_path, "retry")
+    run_block(root, upgrade_block(), clean.index("docker compose pull") + 1)
+    marker = (root / MARKER).read_text()
+    again = run_block(root, upgrade_block())
+    assert again.status == 0, again.output
+    assert "Finishing: .env already names X" in again.output
+    for step in ("nano", "systemctl start ibp-backup.service", "mv .env", "install -d"):
+        assert not [s for s in again.steps if s.startswith(step)], step
+    assert again.steps.index("docker compose up -d --wait") < again.steps.index(ENABLE)
+    assert (root / MARKER).read_text() == marker
+
+
+def test_upgrade_run_again_before_the_switch_pins_its_own_backup(tmp_path):
+    """Each attempt that gets to the backup pins its own and names it."""
+    clean = upgrade_steps(tmp_path)
+    root = fresh_upgrade(tmp_path, "retry")
+    run_block(root, upgrade_block(), clean.index("mv .env.next-X .env") + 1)
+    (root / MARKER).write_text("/elsewhere/before-X-first.db.zst\n")
+    again = run_block(root, upgrade_block())
+    assert again.status == 0, again.output
+    pinned = Path((root / MARKER).read_text().strip())
+    assert pinned.parent == root / "home" / "backups" / "ibp-pinned" and pinned.exists()
 
 
 def test_upgrade_says_what_a_failure_after_the_switch_left(tmp_path):
-    """Once .env names the new tag, a failure says so."""
-    clean = run_block(without_upgrade_save(sandbox(tmp_path)), upgrade_block())
-    root = without_upgrade_save(sandbox(tmp_path / "failed"))
-    result = run_block(
-        root, upgrade_block(), clean.steps.index("docker compose pull") + 1
-    )
+    """Once .env names the new tag, a failure says so and how to go on."""
+    clean = upgrade_steps(tmp_path)
+    root = fresh_upgrade(tmp_path, "failed")
+    result = run_block(root, upgrade_block(), clean.index("docker compose pull") + 1)
     assert result.status != 0
-    assert ".env names X and the shipment timer is stopped" in result.output
+    assert ".env names X and the shipment timer is disabled" in result.output
+    assert "run this block again to finish, or roll back" in result.output
 
 
-def test_upgrade_keeps_the_first_backups_name(tmp_path):
-    """A re-run after the switch names the backup taken before it."""
-    clean = run_block(without_upgrade_save(sandbox(tmp_path)), upgrade_block())
-    root = without_upgrade_save(sandbox(tmp_path / "retry"))
-    run_block(root, upgrade_block(), clean.steps.index("docker compose up -d") + 1)
-    record = root / "srv" / "ibp" / ".backup-before-X"
-    record.write_text("data-first.db.zst\n")
-    again = run_block(root, upgrade_block())
-    assert again.status == 0
-    assert record.read_text() == "data-first.db.zst\n"
-    assert "Backup for a rollback: ~/backups/ibp/data-first.db.zst" in again.output
+def test_backups_never_prune_the_pinned_one():
+    """ibp-backup prunes only its own data-*.db.zst, not ibp-pinned/."""
+    script = (TOPLEVEL / "scripts" / "backup" / "ibp-backup").read_text()
+    assert "LOCAL_DIR=${IBP_BACKUP_DIR:-/home/jstarr/backups/ibp}" in script
+    assert 'ls -1 "$LOCAL_DIR"/data-*.db.zst' in script
+    assert "ibp-pinned" not in script
 
 
 @pytest.mark.parametrize(
-    "edited, shell, prefix",
+    "edited, shell",
     [
-        ("IBP_UID=${SHIP_UID}\n", {}, ""),
-        ("IBP_GID=jstarr\n", {}, ""),
-        ("", {"IBP_UID": "abc"}, ""),
-        ("IBP_TAG=v0.0.1\n", {}, ""),
+        ("IBP_UID=${SHIP_UID}\n", {}),
+        ("IBP_GID=jstarr\n", {}),
+        ("", {"IBP_UID": "abc"}),
+        ("IBP_TAG=v0.0.1\n", {}),
+        # Compose would deploy an exported IBP_TAG instead of the file's.
+        ("", {"IBP_TAG": "v9.9.9"}),
     ],
 )
-def test_upgrade_stops_on_a_bad_copy_before_changing_anything(
-    tmp_path, edited, shell, prefix
-):
-    """An interpolated or named IBP_UID/IBP_GID, or a copy naming another
-    tag, stops the block, saying so, before the timer is stopped; fixed, a
-    re-run goes on."""
-    root = without_upgrade_save(sandbox(tmp_path))
-    result = run_block(
-        root, prefix + upgrade_block(), env={"NANO_EXTRA": edited, **shell}
-    )
+def test_upgrade_stops_on_a_bad_copy_before_changing_anything(tmp_path, edited, shell):
+    """An interpolated or named IBP_UID/IBP_GID, a copy naming another tag,
+    or another IBP_TAG exported, stops the block, saying so, before the
+    timer is disabled; fixed, a re-run goes on."""
+    root = fresh_upgrade(tmp_path, "bad")
+    result = run_block(root, upgrade_block(), env={"NANO_EXTRA": edited, **shell})
     assert result.status != 0
     assert "NOT UPGRADED: " in result.output and "nothing has changed" in result.output
-    assert not [s for s in result.steps if "systemctl stop" in s or "install -d" in s]
+    assert not [
+        s for s in result.steps if "systemctl disable" in s or "install -d" in s
+    ]
     assert (root / UPGRADE_ENV).read_text() == "IBP_TAG=v1.0.0\n"
     assert run_block(root, upgrade_block()).status == 0
 
@@ -658,7 +756,7 @@ def test_upgrade_stops_on_a_bad_copy_before_changing_anything(
 def test_upgrade_ignores_an_unexported_shell_variable(tmp_path):
     """Only an exported IBP_UID reaches docker compose, so only that one
     counts."""
-    root = without_upgrade_save(sandbox(tmp_path))
+    root = fresh_upgrade(tmp_path, "run")
     result = run_block(root, "IBP_UID=1009\n" + upgrade_block())
     assert result.status == 0, result.output
     assert "install -d -o 1000 -g 1000 -m 0750 /srv/ibp/logs" in result.steps

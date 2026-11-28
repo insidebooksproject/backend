@@ -30,6 +30,7 @@ HTTPS.
 | `/srv/ibp/logs/` | the error logs, owned by the container's user (`IBP_UID`:`IBP_GID`, default 1000:1000, `jstarr`) like `data/`, mode 0750, each file 0640 (they can hold inmate data): `backend.jsonl` (the backend's own WARNING and above) and `client-errors.jsonl` (the browser reports, `POST /api/client-errors`), each rotated at 5 MiB with 4 old files kept. Not under `data/`, so the backups stay the database only |
 | `/srv/ibp/data/data.db-wal`, `data.db-shm` | the database's write-ahead log and its index, there while anything has it open: part of the database, so `data.db` is never copied, moved or replaced without them while they exist (see below) |
 | `~/.local/bin/ibp-backup` + timer | backups, see [`scripts/backup/`](../../scripts/backup/README.md) |
+| `~/backups/ibp-pinned/` | the backup each upgrade took just before switching (`before-<tag>-<time>.db.zst`, named in `/srv/ibp/.backup-before-<tag>`), for its rollback; outside `ibp-backup`'s rotation, so never pruned: delete old ones by hand |
 | `~/.local/bin/ibp-label-refund` + timer | unused-label refunds, see [`scripts/label-refund/`](../../scripts/label-refund/README.md) |
 | `~/.local/bin/ibp-shipment-sync` + timer | shipment tracking, see [`scripts/shipment-sync/`](../../scripts/shipment-sync/README.md) |
 | `/usr/local/bin/ibp-error-digest` + timer (root) | weekly redacted error digest in `/srv/ibp-logs/digest/`, see [`scripts/error-digest/`](../../scripts/error-digest/README.md) |
@@ -153,21 +154,41 @@ block stops, saying so, before it changes anything if one isn't. Only
 owners and modes change, never a file's content, and an unchanged owner is
 left as it is, so it is safe to run again.
 
-The order keeps the running version whole until a backup exists. The new
-`.env` is edited as a copy, `.env.next-<new tag>`, and checked (its
-`IBP_TAG` must be the new tag, the ids numbers) while the timer still runs.
-Then the block stops the shipment timer, waits for a running sync and holds
-the sync's run lock, so no sync can start on the new image and migrate the
-database before the backup. It takes a fresh backup (`ibp-backup`, which
-reads only the database, not `.env`) and stops if it fails; the first
-backup taken for this upgrade is named in `.backup-before-<new tag>` and
-printed, for the rollback. Only then does it set the log owner and swap the
-copy in as `.env`, pull and start. Until that swap `.env` names the running
-version, so a reboot (whose shipment timer starts again) runs the old
-image. If the block stops, its message says what it left: the timer stopped
-or not, and whether `.env` and the log owner changed. It starts the timer
-again at the end if it was running before, and keeps the first saved copy
-of the previous `.env` and the first backup's name if it is run again.
+The order keeps the running version whole until a backup exists, and no
+sync can start on either image until the new version is up:
+
+1. The new `.env` is edited as a copy, `.env.next-<new tag>`, and checked
+   while nothing else has changed: its `IBP_TAG` must be the new tag (and
+   an `IBP_TAG` exported in the shell, which compose would use instead,
+   must match it), the ids numbers.
+2. The shipment timer is disabled and stopped (`disable --now`), so not
+   even a reboot starts a sync until the end; whether it was enabled and
+   running is kept, once. The block waits for a running sync and holds the
+   sync's run lock.
+3. A fresh backup (`ibp-backup`, which reads only the database, not
+   `.env`), stopping if it fails. That backup is copied, never moved, to
+   `~/backups/ibp-pinned/before-<new tag>-<time>.db.zst`, outside the
+   backups `ibp-backup` prunes, and its path written to
+   `/srv/ibp/.backup-before-<new tag>` (each attempt that gets this far
+   writes its own) and printed, for a rollback.
+4. Only then the log owner is set and the copy swapped in as `.env`.
+5. Pull, start and wait until both containers are healthy
+   (`up -d --wait`), check `/api/health`, and only then enable and start
+   the timer again as it was.
+
+If the block stops, its message says what it left and how to resume the
+timer for the version `.env` names. Before the swap, `.env` names the
+running version, which a reboot starts; the message says how to put the
+log owner back if the ownership step or the swap failed. After the swap
+(a pull or start that failed or was interrupted), finish by running the
+block again: it sees that `.env` already names the new tag and only runs
+the pull onward (pull, start, health check, timer), without a new backup,
+so `.backup-before-<new tag>` still names the one taken before the swap.
+Don't start the timer by hand before the new version is healthy, or a
+sync could run the new image's migration against a stack that isn't up.
+If the new version can't be made to run, roll back (below) with the
+pinned backup. A re-run keeps the first saved copy of the previous `.env`
+and the timer's first recorded state.
 
     (
       set -Eeuo pipefail
@@ -183,89 +204,122 @@ of the previous `.env` and the first backup's name if it is run again.
         echo "NOT UPGRADED: $saved names ${saved_tag:-no IBP_TAG}, not the version to roll back to; fix it by hand first"
         exit 1
       fi
-      # The new .env is edited as a copy, kept if this block is run again:
-      # .env itself changes only once a backup exists and no sync can start.
       next=.env.next-<new tag>
-      if [ ! -e "$next" ]; then cp -p .env "$next"; fi
-      "${EDITOR:-nano}" "$next"                  # new IBP_TAG
-      # A setting of the copy as compose reads it: the last one, without
-      # quotes, spaces or a trailing comment.
-      setting() {
-        local value
-        value=$(sed -n "s/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$1[[:space:]]*=//p" "$next" | tail -n 1)
-        value=${value%%[[:space:]]#*}
-        printf '%s' "$value" | tr -d "\"' \t\r"
-      }
-      next_tag=$(setting IBP_TAG)
-      if [ "$next_tag" != "<new tag>" ]; then
-        echo "NOT UPGRADED: $next names IBP_TAG '${next_tag}', not <new tag>; fix it and run this block again; nothing has changed"
-        exit 1
-      fi
-      # The container's user, as compose will run it: IBP_UID/IBP_GID as
-      # exported (what docker compose sees), else the copy's, else 1000.
-      owner_id() {
-        local value
-        if value=$(printenv "$1"); then :; else value=$(setting "$1"); fi
-        value=$(printf '%s' "$value" | tr -d "\"' \t\r")
-        case "$value" in
-          '') value=1000 ;;
-          *[!0-9]*)
-            echo "NOT UPGRADED: $1 is '$value', not a number; set it to the uid or gid itself in $next (or the environment) and run this block again; nothing has changed" >&2
-            return 1 ;;
-        esac
-        printf '%s\n' "$value"
-      }
-      log_uid=$(owner_id IBP_UID)
-      log_gid=$(owner_id IBP_GID)
-      # No sync may start until the new version is up: one on the new image
-      # would migrate the database before the backup. The timer's state is
-      # kept, once, to restore it at the end.
       timer_was=.shipment-timer-before-<new tag>
-      if [ ! -e "$timer_was" ]; then
-        timer_state=$(systemctl show -p ActiveState --value ibp-shipment-sync.timer)
-        printf '%s\n' "$timer_state" > "$timer_was"
+      live_tag=$(sed -n 's/^IBP_TAG=//p' .env | tail -n 1)
+      if [ "$live_tag" = "<new tag>" ] && [ ! -e "$next" ]; then
+        # The swap was made by an earlier run: only finish.
+        echo "Finishing: .env already names <new tag>"
+        left=".env names <new tag> and the shipment timer is disabled; run this block again to finish, or roll back with the backup in .backup-before-<new tag>; don't start the timer before the new version is healthy"
+      else
+        # The new .env is edited as a copy, kept if this block is run again:
+        # .env itself changes only once a backup exists and no sync can start.
+        if [ ! -e "$next" ]; then cp -p .env "$next"; fi
+        "${EDITOR:-nano}" "$next"                # new IBP_TAG
+        # A setting of the copy as compose reads it: the last one, without
+        # quotes, spaces or a trailing comment.
+        setting() {
+          local value
+          value=$(sed -n "s/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$1[[:space:]]*=//p" "$next" | tail -n 1)
+          value=${value%%[[:space:]]#*}
+          printf '%s' "$value" | tr -d "\"' \t\r"
+        }
+        next_tag=$(setting IBP_TAG)
+        if [ "$next_tag" != "<new tag>" ]; then
+          echo "NOT UPGRADED: $next names IBP_TAG '${next_tag}', not <new tag>; fix it and run this block again; nothing has changed"
+          exit 1
+        fi
+        # Compose takes an exported IBP_TAG over .env's.
+        if exported_tag=$(printenv IBP_TAG) && [ "$exported_tag" != "<new tag>" ]; then
+          echo "NOT UPGRADED: IBP_TAG is exported as '$exported_tag', which compose would deploy instead of <new tag>; unset it and run this block again; nothing has changed"
+          exit 1
+        fi
+        # The container's user, as compose will run it: IBP_UID/IBP_GID as
+        # exported (what docker compose sees), else the copy's, else 1000.
+        owner_id() {
+          local value
+          if value=$(printenv "$1"); then :; else value=$(setting "$1"); fi
+          value=$(printf '%s' "$value" | tr -d "\"' \t\r")
+          case "$value" in
+            '') value=1000 ;;
+            *[!0-9]*)
+              echo "NOT UPGRADED: $1 is '$value', not a number; set it to the uid or gid itself in $next (or the environment) and run this block again; nothing has changed" >&2
+              return 1 ;;
+          esac
+          printf '%s\n' "$value"
+        }
+        log_uid=$(owner_id IBP_UID)
+        log_gid=$(owner_id IBP_GID)
+        # No sync may start, not even after a reboot, until the new version
+        # is up: one on either image could migrate the database before the
+        # backup, or past the running web image. Whether the timer was
+        # enabled and running is kept, once, to put it back at the end.
+        if [ ! -e "$timer_was" ]; then
+          enabled=$(systemctl show -p UnitFileState --value ibp-shipment-sync.timer)
+          active=$(systemctl show -p ActiveState --value ibp-shipment-sync.timer)
+          printf '%s %s\n' "$enabled" "$active" > "$timer_was"
+        fi
       fi
-      left="the shipment timer may be stopped; .env and the log owner are unchanged, so the current version still runs (start the timer to stay on it)"
-      sudo systemctl stop ibp-shipment-sync.timer
-      left="the shipment timer is stopped; .env and the log owner are unchanged, so the current version still runs (start the timer to stay on it)"
-      # Wait for a sync already running: the service (a running oneshot is
-      # "activating") and any one-off backend container (an older wrapper's has
-      # no label of its own). Each query must succeed: a failed one stops the
-      # block instead of reading as "nothing running".
-      while :; do
-        state=$(systemctl show -p ActiveState --value ibp-shipment-sync.service)
-        case "$state" in active | activating | deactivating | reloading) sleep 5; continue ;; esac
-        running=$(docker ps -q --filter label=com.docker.compose.oneoff=True --filter label=com.docker.compose.service=ibp-backend)
-        if [ -z "$running" ]; then break; fi
-        sleep 5
-      done
+      # A finishing run after the timer was already put back has no record.
+      was_enabled=restored was_active=restored
+      if [ -e "$timer_was" ]; then read -r was_enabled was_active < "$timer_was"; fi
+      resume=""
+      if [ "$was_enabled" = enabled ]; then resume="sudo systemctl enable ibp-shipment-sync.timer"; fi
+      if [ "$was_active" = active ]; then resume="${resume:+$resume && }sudo systemctl start ibp-shipment-sync.timer"; fi
+      resume=${resume:-nothing (it was disabled and stopped before, or is back already)}
+      if [ "$live_tag" != "<new tag>" ] || [ -e "$next" ]; then
+        left="the shipment timer may be disabled; .env (still $live_tag) and the log owner are unchanged, so the current version still runs; to stay on it, resume the timer: $resume"
+        sudo systemctl disable --now ibp-shipment-sync.timer
+        left="the shipment timer is disabled; .env (still $live_tag) and the log owner are unchanged, so the current version still runs; to stay on it, resume the timer: $resume"
+        # Wait for a sync already running: the service (a running oneshot is
+        # "activating") and any one-off backend container (an older wrapper's has
+        # no label of its own). Each query must succeed: a failed one stops the
+        # block instead of reading as "nothing running".
+        while :; do
+          state=$(systemctl show -p ActiveState --value ibp-shipment-sync.service)
+          case "$state" in active | activating | deactivating | reloading) sleep 5; continue ;; esac
+          running=$(docker ps -q --filter label=com.docker.compose.oneoff=True --filter label=com.docker.compose.service=ibp-backend)
+          if [ -z "$running" ]; then break; fi
+          sleep 5
+        done
+      fi
       # Hold the sync's run lock (the wrapper's) for the rest of the block, so
       # no sync can start until it is done.
       mkdir -p ~/.local/state/ibp-shipment-sync
       exec 9>>~/.local/state/ibp-shipment-sync/run.lock
-      flock -n 9 || { echo "NOT UPGRADED: a shipment sync holds its run lock; wait for it to finish and run this block again; the shipment timer is stopped, .env and the log owner are unchanged"; exit 1; }
-      # A fresh backup of the database as the current version left it; the
-      # service fails if the backup does (an integrity check included).
-      sudo systemctl start ibp-backup.service
-      backup=$(ls -1 ~/backups/ibp/data-*.db.zst | sort | tail -n 1)
-      backup_was=.backup-before-<new tag>
-      if [ ! -e "$backup_was" ]; then printf '%s\n' "${backup##*/}" > "$backup_was"; fi
-      read -r backup_name < "$backup_was"
-      echo "Backup for a rollback: ~/backups/ibp/$backup_name"
-      # The error logs: the new container's user owns the directory, closed
-      # to other users, and its files, 0640 (no change if the owner is the
-      # same). Then the new .env takes effect.
-      left="the shipment timer is stopped and .env unchanged, but the logs may now be owned by $log_uid:$log_gid for the new version (were $(stat -c %u:%g /srv/ibp/logs 2>/dev/null || echo missing))"
-      sudo install -d -o "$log_uid" -g "$log_gid" -m 0750 /srv/ibp/logs
-      sudo find /srv/ibp/logs -maxdepth 1 -type f -name '*.jsonl*' -exec chown "$log_uid:$log_gid" {} + -exec chmod 0640 {} +
-      mv "$next" .env
-      left=".env names <new tag> and the shipment timer is stopped; the new version may not be running yet"
+      flock -n 9 || { echo "NOT UPGRADED: a shipment sync holds its run lock; wait for it to finish and run this block again; $left"; exit 1; }
+      if [ "$live_tag" != "<new tag>" ] || [ -e "$next" ]; then
+        # A fresh backup of the database as the current version left it; the
+        # service fails if the backup does (an integrity check included). It
+        # is pinned outside ibp-backup's rotation for a rollback.
+        sudo systemctl start ibp-backup.service
+        backup=$(ls -1 ~/backups/ibp/data-*.db.zst | sort | tail -n 1)
+        mkdir -p ~/backups/ibp-pinned
+        pinned=~/backups/ibp-pinned/before-<new tag>-$(date +%Y-%m-%d_%H%M%S).db.zst
+        cp -p "$backup" "$pinned"
+        printf '%s\n' "$pinned" > .backup-before-<new tag>
+        echo "Backup for a rollback: $pinned (named in /srv/ibp/.backup-before-<new tag>)"
+        # The error logs: the new container's user owns the directory, closed
+        # to other users, and its files, 0640 (no change if the owner is the
+        # same). Then the new .env takes effect.
+        old_owner=$(stat -c %u:%g /srv/ibp/logs 2>/dev/null || echo none)
+        restore="sudo chown -R $old_owner /srv/ibp/logs"
+        if [ "$old_owner" = none ]; then restore="nothing (there was no /srv/ibp/logs)"; fi
+        left="the shipment timer is disabled and .env unchanged (still $live_tag), but the logs may be owned by $log_uid:$log_gid for the new version; to stay on the current version, put the owner back ($restore) and resume the timer: $resume"
+        sudo install -d -o "$log_uid" -g "$log_gid" -m 0750 /srv/ibp/logs
+        sudo find /srv/ibp/logs -maxdepth 1 -type f -name '*.jsonl*' -exec chown "$log_uid:$log_gid" {} + -exec chmod 0640 {} +
+        mv "$next" .env
+        left=".env names <new tag> and the shipment timer is disabled; run this block again to finish, or roll back with the backup in .backup-before-<new tag>; don't start the timer before the new version is healthy"
+      fi
       docker compose pull
-      docker compose up -d
-      docker image prune -f
-      read -r timer_state < "$timer_was"
-      if [ "$timer_state" = active ]; then sudo systemctl start ibp-shipment-sync.timer; fi
+      docker compose up -d --wait
+      curl -fsS -o /dev/null http://localhost/api/health
+      left="<new tag> is up and healthy, but the shipment timer may not be back; resume it: $resume"
+      if [ "$was_enabled" = enabled ]; then sudo systemctl enable ibp-shipment-sync.timer; fi
+      if [ "$was_active" = active ]; then sudo systemctl start ibp-shipment-sync.timer; fi
       rm -f "$timer_was"
+      left="<new tag> is up and healthy and the shipment timer as it was; only the clean-up of old images failed"
+      docker image prune -f
     )
 
 The links between requests and labels (`package_shipments`) are stored, and
@@ -340,11 +394,12 @@ under the old image names.
 
 If the new release ran a database migration, the old backend can't start
 on the migrated database, so restore the backup taken just before the
-upgrade (the upgrade printed its name and kept it in
-`/srv/ibp/.backup-before-<new tag>`) with the block below (writes since then are lost, but the database
-it replaces is kept, with its SQLite side files, which must not stay
-beside the restored database, in a new `data/before-rollback-…`
-directory). It stops the shipment timer and holds
+upgrade with the block below, `<pinned backup>` in it replaced by the
+path in `/srv/ibp/.backup-before-<new tag>` (the upgrade printed it; it is
+pinned in `~/backups/ibp-pinned/`, outside the backups `ibp-backup`
+prunes). Writes since then are lost, but the database it replaces is
+kept, with its SQLite side files, which must not stay beside the restored
+database, in a new `data/before-rollback-…` directory. It stops the shipment timer and holds
 the sync's run lock throughout, so no sync can migrate the restored
 database, and it stops the backup timer and waits for a backup in progress,
 so none has the database open while it is swapped; it checks everything
@@ -394,7 +449,7 @@ again at the end if it was running:
       mkdir -p ~/restore
       staging=~/restore/data-$EPOCHSECONDS-$$.db
       rm -f "$staging"
-      zstd -d ~/backups/ibp/data-<before upgrade>.db.zst -o "$staging" || { echo "NOT RESTORED: the backup did not decompress; nothing was changed"; exit 1; }
+      zstd -d <pinned backup> -o "$staging" || { echo "NOT RESTORED: the backup did not decompress; nothing was changed"; exit 1; }
       check=$(sqlite3 "$staging" 'PRAGMA integrity_check;') || check="failed"
       [ "$check" = ok ] || { echo "NOT RESTORED: the backup failed its integrity check; nothing was changed; pick another backup"; exit 1; }
       # Stage the new files beside the live ones, and a new directory for
