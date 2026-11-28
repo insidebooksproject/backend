@@ -670,6 +670,35 @@ def test_client_log_file_is_0640(client, log_dir):
     assert stat.S_IMODE(log_dir.stat().st_mode) == 0o750
 
 
+def test_flood_of_addresses_over_the_global_limit_adds_no_state(caplog):
+    """A report the global window drops gives its address no window, and
+    ended windows are pruned, so distinct addresses can't grow the table."""
+    caplog.set_level(logging.WARNING, logger="ibp.client_errors")
+    clock = FakeClock()
+    limiter = client_errors.RateLimiter(
+        limit=2, global_limit=3, window_s=60, clock=clock
+    )
+    assert sum(limiter.allow(f"10.0.{i // 256}.{i % 256}") for i in range(5000)) == 3
+    assert len(limiter._windows) == 3  # pylint: disable=protected-access
+    clock.now += 60
+    assert limiter.allow("10.9.9.9")
+    assert list(limiter._windows) == ["10.9.9.9"]  # pylint: disable=protected-access
+    assert [record.getMessage() for record in drops(caplog)] == [
+        "dropped 4997 client error reports from all addresses over the limit "
+        "of 3 a minute"
+    ]
+
+
+def test_an_address_over_its_own_limit_uses_no_global_room():
+    """An address's own drops don't take from what the others may send."""
+    limiter = client_errors.RateLimiter(
+        limit=1, global_limit=2, window_s=60, clock=FakeClock()
+    )
+    assert [limiter.allow("a") for _ in range(10)] == [True] + [False] * 9
+    assert limiter.allow("b")
+    assert not limiter.allow("c")
+
+
 def test_secrets_are_scrubbed_before_writing(client, log_dir):
     """A password in data.detail (quoted, spaces and all), a Bearer token in
     exc, a key= in a URL and a token in a list are replaced; inmate details

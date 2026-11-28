@@ -246,8 +246,13 @@ class RateLimiter:
     Each window starts at its first report. When a window that dropped
     reports ends, one WARNING says how many: on the next report from any
     address, or from a timer set at the first drop, whichever comes first.
-    A report one address may send but the global window has no room for is
-    counted as the global window's drop.
+
+    The global limit is checked before an address gets a window, so a
+    report the global window has no room for (its drop) adds no state: at
+    most ``global_limit`` windows start in one global window, so at most
+    twice that are kept. Windows are kept in the order they started, so
+    the ended ones are the oldest and are pruned from the front, without
+    looking at the rest.
     """
 
     limit: int = RATE_LIMIT
@@ -261,15 +266,17 @@ class RateLimiter:
         """Count a report from ``address``; False if it is over a limit."""
         now = self.clock()
         self.flush(now)
-        window = self._windows.setdefault(address, _Window(start=now))
-        if self._global is None:
-            self._global = _Window(start=now)
-        if window.count >= self.limit:
+        window = self._windows.get(address)
+        if window is not None and window.count >= self.limit:
             self._drop(window, now)
             return False
+        if self._global is None:
+            self._global = _Window(start=now)
         if self._global.count >= self.global_limit:
             self._drop(self._global, now)
             return False
+        if window is None:
+            window = self._windows[address] = _Window(start=now)
         window.count += 1
         self._global.count += 1
         return True
@@ -282,12 +289,10 @@ class RateLimiter:
     def flush(self, now: float | None = None) -> None:
         """Forget ended windows, reporting the drops of each."""
         now = self.clock() if now is None else now
-        ended = [
-            (address, window)
-            for address, window in self._windows.items()
-            if now - window.start >= self.window_s
-        ]
-        for address, window in ended:
+        while self._windows:
+            address, window = next(iter(self._windows.items()))
+            if now - window.start < self.window_s:
+                break
             del self._windows[address]
             if window.dropped:
                 logger.warning(
