@@ -33,7 +33,7 @@ kiosk's as from its host.
 | `<station>/<host>/journal/failed-units-<day>.jsonl` | the units failed at the kiosk's last upload that day (UTC), rewritten at every upload; empty or missing when none is. One journal-shaped line per unit: `SYSLOG_IDENTIFIER` `ibp-kiosk-log-upload`, `PRIORITY` `3`, `MESSAGE` `<unit> failed`, `UNIT` (system) or `USER_UNIT` (the kiosk user's), `__REALTIME_TIMESTAMP`. Each becomes one event a day, app `systemd`, `unit failed: <unit>` or `user unit failed: <unit>`, so a unit that stays failed counts every day the station runs |
 | the same folders' `{printer,errors}-*.jsonl` | only the `<app> starting` lines (`shippy starting`, `label watcher starting`), and of those only `ts`, `app`, `host` and the version (`version`, or `data.version`), for each station's (a kiosk: each host's) app versions. The print server's starting line has no version |
 | `/srv/ibp/logs/*.jsonl` | `backend.jsonl` (host `ibp-server`) and `client-errors.jsonl` (host: the client address, named by `/etc/ibp-error-digest/hosts`) |
-| `journalctl -u 'ibp-*' -p warning` | the Pi's own jobs (backup, refunds, sync, this one), and `systemctl --failed`: a snapshot when the digest runs, shown at that time (after the window's end if the run is late) |
+| `journalctl -u 'ibp-*' -p warning` | the Pi's own jobs (backup, refunds, sync, this one), and `systemctl --failed`: a snapshot when the digest runs (after the window's end if the run is late), listed in its own section, **Failed now** (`failed_now`, with the time it was seen), never in the week's events, counts or `seen.json` |
 
 The week is half-open, from the Thursday 09:00 America/Chicago before last
 to the latest one at or before the run (`since <= ts < until`): a run late
@@ -107,8 +107,9 @@ no raw path.
    and exception line, the logger, the stack as frames only (`file:line
    function`, the last 12, no paths above the package, no source lines or
    locals), and where one raw event is (`raw_event`): `path:line` on the
-   Pi, for `--show-raw`, a `journalctl` or `systemctl` command, or `null`
-   for a file with an unusual name. Digests older than 26 weeks are
+   Pi, for `--show-raw`, a `journalctl` command, or `null`
+   for a file with an unusual name (a **Failed now** unit has a
+   `systemctl status` command). Digests older than 26 weeks are
    removed.
 
 **Redaction.** No `data` field (but a browser app's numeric `status` and

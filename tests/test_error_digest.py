@@ -1006,8 +1006,15 @@ def test_pi_journal_and_failed_units(tree):
     assert apps["ibp-backup"]["raw_event"].startswith(
         "journalctl -u ibp-backup.service "
     )
-    assert apps["systemd"]["message"] == "unit failed: ibp-label-refund.service"
-    assert apps["systemd"]["raw_event"] == "systemctl status ibp-label-refund.service"
+    assert "systemd" not in apps
+    assert report["failed_now"] == [
+        {
+            "unit": "ibp-label-refund.service",
+            "host": "ibp-server",
+            "seen": digest.iso(NOW),
+            "raw_event": "systemctl status ibp-label-refund.service",
+        }
+    ]
     journalctl = system.calls[0]
     assert journalctl[journalctl.index("-u") + 1] == "ibp-*"
     assert journalctl[journalctl.index("-p") + 1] == "warning"
@@ -1775,14 +1782,23 @@ def test_a_secret_in_a_name_never_reaches_the_digest_or_the_state(tree):
     assert TOKEN_NAME not in (tree["state"] / "seen.json").read_text()
 
 
-def test_failed_units_now_are_shown_at_the_time_they_were_seen(tree):
+def test_failed_units_now_are_a_snapshot_outside_the_week(tree):
     late = NOW + timedelta(days=1, hours=2)  # a Friday run (Persistent=)
     system = FakeSystem(failed=["ibp-label-refund.service"])
-    _, report, _ = run(tree, now=late, system=system)
-    (group,) = report["groups"]
-    assert group["message"] == "unit failed: ibp-label-refund.service"
-    assert group["last_seen"] == digest.iso(late)
+    _, report, markdown = run(tree, now=late, system=system)
+    assert report["groups"] == [] and report["summary"]["events"] == 0
+    assert report["summary"]["failed_now"] == 1
+    (unit,) = report["failed_now"]
+    assert unit["seen"] == digest.iso(late)
     assert report["window"]["until"] == digest.iso(NOW)
+    assert "## Failed now on ibp-server (at the run; not in the week's counts)" in (
+        markdown
+    )
+    assert "ibp-label-refund" not in (tree["state"] / "seen.json").read_text()
+    assert "failed now: ibp-label-refund.service" in digest.summary_lines(report)
+    # The next week, with nothing failed: nothing is "gone".
+    _, report, _ = run(tree, now=late + timedelta(days=7))
+    assert report["gone"] == [] and report["failed_now"] == []
 
 
 # The intake's tests (backend tests/test_scrub.py), on the digest's copy of

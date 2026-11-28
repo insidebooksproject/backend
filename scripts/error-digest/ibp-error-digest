@@ -532,6 +532,8 @@ class Run:
     unreadable: Counter = field(default_factory=Counter)
     files_read: int = 0
     generated: datetime | None = None
+    # The Pi's failed units when the run looked (systemctl --failed).
+    failed_now: list[dict] = field(default_factory=list)
     # (station, host, __CURSOR) of each kiosk journal entry read: an upload
     # stopped between its rename and its cursor save exports entries again.
     cursors: set[tuple[str, str, str]] = field(default_factory=set)
@@ -1230,15 +1232,17 @@ def read_pi_journal(run: Run, command: Command) -> None:
         words = line.split()
         failed_name = clean_name(words[0].lstrip("●*")) if words else None
         if failed_name:
-            # A live snapshot: failed when this run looked (which may be
-            # after the window's end), so it is shown at that time.
-            run.events.append(
-                failed_unit_event(
-                    failed_name,
-                    run.generated or run.until,
-                    "ibp-server",
-                    f"systemctl status {failed_name}",
-                )
+            # A live snapshot, as of this run (which may be after the
+            # window's end): its own section, never the week's events, counts
+            # or seen.json, so a unit that failed after the window neither
+            # counts in it nor turns up "gone" the week after.
+            run.failed_now.append(
+                {
+                    "unit": failed_name,
+                    "host": "ibp-server",
+                    "seen": iso(run.generated or run.until),
+                    "raw_event": f"systemctl status {failed_name}",
+                }
             )
 
 
@@ -1648,6 +1652,7 @@ def build_report(
             "gone": len(gone),
             "muted_groups": len(hidden),
             "muted_events": sum(g.count for g in hidden),
+            "failed_now": len(run.failed_now),
             "files_read": run.files_read,
             "unreadable_lines": sum(run.unreadable.values()),
         },
@@ -1662,6 +1667,8 @@ def build_report(
             }
             for g in sorted(hidden, key=lambda g: (-g.count, g.fingerprint))
         ],
+        # Not part of the week: the Pi's failed units at the run's time.
+        "failed_now": sorted(run.failed_now, key=lambda u: u["unit"]),
         "stations": stations,
         "versions": versions,
         "unreadable": dict(sorted(run.unreadable.items())),
@@ -1742,6 +1749,16 @@ def render_markdown(report: dict) -> str:
         out += [
             f"- `{m['fingerprint']}` {m['app']} x{m['count']}: {m['reason']}"
             for m in report["muted"]
+        ]
+        out.append("")
+    if report["failed_now"]:
+        out += [
+            "## Failed now on ibp-server (at the run; not in the week's counts)",
+            "",
+        ]
+        out += [
+            f"- {code(u['unit'])} failed as of {u['seen']}: {code(u['raw_event'])}"
+            for u in report["failed_now"]
         ]
         out.append("")
     out += ["## Stations", ""]
@@ -1998,6 +2015,9 @@ def summary_lines(report: dict) -> list[str]:
         f"{s['events']} events, {s['groups']} groups: {s['new']} new, {s['growing']} growing,"
         f" {s['recurring']} recurring, {s['gone']} gone, {s['muted_groups']} muted",
     ]
+    if report["failed_now"]:
+        units = ", ".join(u["unit"] for u in report["failed_now"])
+        lines.append(f"failed now: {units}")
     stale = [st["folder"] for st in report["stations"] if st["stale"]]
     if stale:
         lines.append(f"no upload all week: {', '.join(stale)}")
