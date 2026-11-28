@@ -144,11 +144,18 @@ write it. That step changes nothing on a Pi that already has it.
 Since v1.0.23 the backend makes its log files 0640 (and a log directory it
 creates 0750), and the block closes what an older release left open: it
 sets `/srv/ibp/logs` to 0750 and each `*.jsonl*` file in it, rotated copies
-too, to 0640, all owned by `IBP_UID`:`IBP_GID` from `.env` (quotes, spaces
-and a trailing comment are ignored; 1000 if unset or not a number, as
-`compose.yaml` runs the container), so the backend can still write them.
-Only owners and modes change, never a file's content, so it is safe to run
-again. It does this before it stops the shipment timer.
+too, to 0640, all owned by the user `compose.yaml` will run the container
+as, so the backend can still write them: `IBP_UID`:`IBP_GID` from the
+shell's environment, else from the edited `.env` (quotes, spaces and a
+trailing comment are ignored), else 1000. They must be plain numbers there
+(no `${...}`); the block stops, saying so, if one isn't. Only owners and
+modes change, never a file's content, so it is safe to run again.
+
+The new `.env` is edited as a copy, `.env.next-<new tag>`, before the
+timer is stopped, so the log ownership follows the configuration being
+deployed and a failure there leaves the timer running; the copy replaces
+`.env` only once no sync can start, since a sync uses `.env`'s `IBP_TAG`.
+A re-run opens the same copy again.
 
 The block stops the shipment timer and holds the sync's run lock while it
 runs, so no sync can start on the new image and migrate the database before
@@ -157,7 +164,7 @@ It keeps the first saved copy of the previous `.env` if it is run again.
 
     (
       set -Eeuo pipefail
-      trap 'echo "UPGRADE STOPPED: fix the failed step and run this block again (the shipment timer stays stopped until it completes)" >&2' ERR
+      trap 'echo "UPGRADE STOPPED: fix the failed step and run this block again (once stopped, the shipment timer stays stopped until it completes)" >&2' ERR
       cd /srv/ibp
       # Save the previous .env once: a re-run after .env was edited must
       # not replace the saved copy with the new tag.
@@ -168,15 +175,31 @@ It keeps the first saved copy of the previous `.env` if it is run again.
         echo "NOT UPGRADED: $saved names ${saved_tag:-no IBP_TAG}, not the version to roll back to; fix it by hand first"
         exit 1
       fi
-      # The error logs: the container's user (IBP_UID/IBP_GID in .env, else
-      # 1000, as compose.yaml has it) owns the directory, closed to other
-      # users, and its files, 0640. Before the timer is stopped, so a
-      # failure here leaves it as it was.
+      # The new .env is edited as a copy while the timer still runs (a
+      # sync started now would use .env, so .env itself changes only once
+      # none can start) and kept if this block is run again.
+      next=.env.next-<new tag>
+      if [ ! -e "$next" ]; then cp -p .env "$next"; fi
+      "${EDITOR:-nano}" "$next"                  # new IBP_TAG
+      # The error logs: the container's user, as compose.yaml will run it
+      # (IBP_UID/IBP_GID from the shell, else the new .env, else 1000), owns
+      # the directory, closed to other users, and its files, 0640. Before
+      # the timer is stopped, so a failure here leaves it as it was.
       env_id() {
         local value
-        value=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" .env | tail -n 1)
-        value=$(printf '%s' "${value%%#*}" | tr -d "\"' \t\r")
-        case "$value" in '' | *[!0-9]*) value=1000 ;; esac
+        if [ -n "${!1+set}" ]; then
+          value=${!1}
+        else
+          value=$(sed -n "s/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$1[[:space:]]*=//p" "$next" | tail -n 1)
+          value=${value%%[[:space:]]#*}
+        fi
+        value=$(printf '%s' "$value" | tr -d "\"' \t\r")
+        case "$value" in
+          '') value=1000 ;;
+          *[!0-9]*)
+            echo "NOT UPGRADED: $1 is '$value', not a number; set it to the uid or gid itself in $next and run this block again" >&2
+            return 1 ;;
+        esac
         printf '%s\n' "$value"
       }
       log_uid=$(env_id IBP_UID)
@@ -208,7 +231,7 @@ It keeps the first saved copy of the previous `.env` if it is run again.
       mkdir -p ~/.local/state/ibp-shipment-sync
       exec 9>>~/.local/state/ibp-shipment-sync/run.lock
       flock -n 9 || { echo "NOT UPGRADED: a shipment sync holds its run lock; wait for it to finish and run this block again"; exit 1; }
-      "${EDITOR:-nano}" .env                     # new IBP_TAG
+      mv "$next" .env                            # the new IBP_TAG takes effect
       sudo systemctl start ibp-backup.service    # a fresh backup first
       docker compose pull
       docker compose up -d

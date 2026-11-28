@@ -55,7 +55,7 @@ install() {
   command install "${args[@]}"
 }
 cat() { step cat "$@" && printf 'EZAKtest\n'; }
-nano() { step nano "$@" && printf 'IBP_TAG=X\n' > "$1"; }
+nano() { step nano "$@" && printf 'IBP_TAG=X\n%s' "${NANO_EXTRA:-}" > "$1"; }
 git() {
   step git "$@" || return 1
   command mkdir -p "$3/deploy/pi"
@@ -482,7 +482,9 @@ def test_drain_waits_while_a_sync_runs(tmp_path, block, env):
     )
     assert result.returncode == 124  # still waiting when timed out
     log = (tmp_path / "log").read_text()
-    for later in ("flock", "install -D", "compose down", "nano"):
+    # The upgrade's .env edit is on a copy, before the drain; the copy
+    # replaces .env (mv .env.next-...) only after it.
+    for later in ("flock", "install -D", "compose down", "mv .env.next"):
         assert later not in log
 
 
@@ -531,38 +533,63 @@ def test_upgrade_stops_the_timer_and_restores_its_state(tmp_path, timer, restart
 
 
 @pytest.mark.parametrize(
-    "env, owner",
+    "edited, shell, owner",
     [
-        ("", "1000 -g 1000"),
-        ("IBP_UID=1001\nIBP_GID=1002\n", "1001 -g 1002"),
-        ('IBP_UID="1001"\nIBP_GID=\'1002\'\n', "1001 -g 1002"),
-        ("  IBP_UID = 1001  # jstarr\r\nIBP_GID=1002\t\n", "1001 -g 1002"),
-        ("IBP_UID=1001\nIBP_UID=1003\n", "1003 -g 1000"),
-        ("IBP_UID=jstarr\nIBP_GID=\n", "1000 -g 1000"),
+        ("", {}, "1000 -g 1000"),
+        ("IBP_UID=1001\nIBP_GID=1002\n", {}, "1001 -g 1002"),
+        ("IBP_UID=\"1001\"\nIBP_GID='1002'\n", {}, "1001 -g 1002"),
+        ("  IBP_UID = 1001  # jstarr\r\nIBP_GID=1002\t\n", {}, "1001 -g 1002"),
+        ("export IBP_UID=1001\nIBP_UID=1003\n", {}, "1003 -g 1000"),
+        ("IBP_UID=\nIBP_GID=\n", {}, "1000 -g 1000"),
+        # As compose does, the shell's environment wins over .env.
+        ("IBP_UID=1001\n", {"IBP_UID": "1005", "IBP_GID": ""}, "1005 -g 1000"),
     ],
 )
-def test_upgrade_owns_the_logs_as_the_container_before_stopping_the_timer(
-    tmp_path, env, owner
+def test_upgrade_owns_the_logs_as_the_new_env_says_before_stopping_the_timer(
+    tmp_path, edited, shell, owner
 ):
-    """The log directory's owner comes from IBP_UID/IBP_GID as written in
-    any form compose takes (else 1000), and is set before the timer is
-    stopped, so that step failing leaves the timer running."""
+    """The log directory's owner comes from IBP_UID/IBP_GID as the edited
+    .env (or the shell) gives them to compose, else 1000; the edit and that
+    step come before the timer is stopped, so that step failing leaves the
+    timer running. .env itself changes only once no sync can start."""
+    env = {"NANO_EXTRA": edited, **shell}
     root = without_upgrade_save(sandbox(tmp_path))
-    dotenv = root / "srv" / "ibp" / ".env"
-    dotenv.write_text(dotenv.read_text() + env)
-    result = run_block(root, upgrade_block())
+    result = run_block(root, upgrade_block(), env=env)
     assert result.status == 0, result.output
     install = f"install -d -o {owner} -m 0750 /srv/ibp/logs"
-    assert install in result.steps
-    stop = result.steps.index("systemctl stop ibp-shipment-sync.timer")
-    assert result.steps.index(install) < stop
+    steps = result.steps
+    stop = steps.index("systemctl stop ibp-shipment-sync.timer")
+    assert steps.index("nano .env.next-X") < steps.index(install) < stop
+    assert steps.index("flock -n 9") < steps.index("mv .env.next-X .env")
+    assert (
+        root / "srv" / "ibp" / ".env"
+    ).read_bytes() == f"IBP_TAG=X\n{edited}".encode()
+    assert not (root / "srv" / "ibp" / ".env.next-X").exists()
 
     failed = without_upgrade_save(sandbox(tmp_path / "failed"))
-    failed_env = failed / "srv" / "ibp" / ".env"
-    failed_env.write_text(failed_env.read_text() + env)
-    at = result.steps.index(install) + 1
-    steps = run_block(failed, upgrade_block(), at).steps
+    steps = run_block(failed, upgrade_block(), steps.index(install) + 1, env).steps
     assert not [step for step in steps if step.startswith("systemctl stop")]
+    assert (failed / "srv" / "ibp" / ".env").read_text() == "IBP_TAG=v1.0.0\n"
+
+
+@pytest.mark.parametrize(
+    "edited, shell",
+    [
+        ("IBP_UID=${SHIP_UID}\n", {}),
+        ("IBP_GID=jstarr\n", {}),
+        ("", {"IBP_UID": "abc"}),
+    ],
+)
+def test_upgrade_stops_on_an_owner_that_is_not_a_number(tmp_path, edited, shell):
+    """An interpolated or named IBP_UID/IBP_GID stops the block, saying so,
+    before the timer is stopped or .env changed; fixed, a re-run goes on."""
+    root = without_upgrade_save(sandbox(tmp_path))
+    result = run_block(root, upgrade_block(), env={"NANO_EXTRA": edited, **shell})
+    assert result.status != 0
+    assert "NOT UPGRADED: IBP_" in result.output and "not a number" in result.output
+    assert not [s for s in result.steps if "systemctl stop" in s or "install -d" in s]
+    assert (root / "srv" / "ibp" / ".env").read_text() == "IBP_TAG=v1.0.0\n"
+    assert run_block(root, upgrade_block()).status == 0
 
 
 def backfill_block(readme: str) -> str:
