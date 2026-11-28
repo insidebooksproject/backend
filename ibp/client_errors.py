@@ -12,8 +12,8 @@ each error here as one event of the shared format without ``ts`` and
   ``book-portal-extension``; ``level`` is WARNING, ERROR or CRITICAL.
 - Secrets are taken out of ``msg``, ``exc``, ``logger`` and every string in
   ``data`` (``ibp/scrub.py``: credentials in URLs, Authorization schemes,
-  ``key=``/``password:`` values, JWTs, long tokens); inmate details are
-  kept.
+  ``key=``/``password:`` values, JWTs, long tokens), and a ``data`` value
+  whose key names a credential is replaced whole; inmate details are kept.
 - What is kept is bounded: ``msg`` and ``exc`` are cut to
   ``MAX_MSG_CHARS`` and ``MAX_EXC_CHARS``; ``data`` keeps at most
   ``MAX_DATA_KEYS`` keys with scalar values (or short lists of them),
@@ -49,7 +49,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .base import app, config
 from .error_log import WriteFailed, client_error_log, timestamp
-from .scrub import scrub_secrets
+from .scrub import SECRET, is_credential_key, scrub_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -109,12 +109,17 @@ def clean_data(data: dict[str, Any]) -> dict[str, Any] | None:
     """``data`` bounded: at most ``MAX_DATA_KEYS`` keys of at most
     ``MAX_DATA_KEY_CHARS`` characters, each value a scalar or a list of at
     most ``MAX_DATA_LIST_ITEMS`` scalars (anything else is left out), and
-    the URL keys without their query string or fragment."""
+    the URL keys without their query string or fragment. A key that names a
+    credential (``password``, ``client_secret``, ``x-api-key``) keeps the
+    key but its value, whatever it is, becomes ``<secret>``."""
     cleaned: dict[str, Any] = {}
     for key, value in data.items():
         if len(cleaned) >= MAX_DATA_KEYS:
             break
         if len(key) > MAX_DATA_KEY_CHARS:
+            continue
+        if is_credential_key(key):
+            cleaned[key] = SECRET
             continue
         if isinstance(value, list):
             items = [clean_scalar(item) for item in value[:MAX_DATA_LIST_ITEMS]]

@@ -6,7 +6,8 @@ are copied rather than imported): a URL's user and password, an
 Authorization scheme's credentials, the value of a ``key=``, ``token=``,
 ``password:`` ... pair (a quoted value whole, spaces and escaped quotes
 and all), a JWT, and any long run of base64 or hex with both letters and
-digits in it.
+digits in it. A structured value whose key names a credential
+(:func:`is_credential_key`) is replaced whole, whatever it is.
 
 Only secrets: inmate names, numbers and addresses are kept, as they are
 largely public and help find a cause (decided 2026-11-28).
@@ -48,6 +49,38 @@ TOKEN = re.compile(
     r"(?<![\w+=-])(?=[\w+=-]*\d)(?=[\w+=-]*[A-Za-z])[\w+=-]{24,}(?![\w+=-])",
     re.A,
 )
+
+
+# The words of a key that names a credential (``client_secret``,
+# ``x-api-key``, ``sessionId``, ``PASSWORD``); ``api`` then ``key`` is one.
+CREDENTIAL_WORDS = frozenset(
+    {
+        "password",
+        "passwd",
+        "passphrase",
+        "pwd",
+        "secret",
+        "token",
+        "apikey",
+        "auth",
+        "authorization",
+        "cookie",
+        "session",
+        "credential",
+        "signature",
+    }
+)
+KEY_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+
+
+def is_credential_key(key: str) -> bool:
+    """Whether ``key`` names a credential: one of its words (split at
+    ``_``, ``-``, ``.``, spaces and camel case; a plural counts) is one of
+    ``CREDENTIAL_WORDS``, or it has ``api`` then ``key``."""
+    words = [word.lower() for word in KEY_WORD.findall(key)]
+    words = [word[:-1] if word.endswith("s") else word for word in words]
+    pairs = (a + b for a, b in zip(words, words[1:]))
+    return any(word in CREDENTIAL_WORDS for word in words) or "apikey" in pairs
 
 
 def scrub_secrets(text: str) -> str:

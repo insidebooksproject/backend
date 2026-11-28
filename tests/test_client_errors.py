@@ -734,6 +734,30 @@ def test_secrets_are_scrubbed_before_writing(client, log_dir):
         assert secret not in text
 
 
+def test_a_credential_keyed_value_is_replaced_whole(client, log_dir):
+    """data.password and other credential keys keep the key, never the
+    value, whatever its shape; other keys are left as they are."""
+    body = report(
+        data={
+            "password": "hunter2",
+            "client_secret": ["a", "b"],
+            "x-api-key": {"nested": "zz"},
+            "sessionId": 12345,
+            "status": 401,
+        }
+    )
+    assert client.post("/client-errors", json=body).status_code == 204
+    (event,) = events(log_dir)
+    assert event["data"] == {
+        "password": "<secret>",
+        "client_secret": "<secret>",
+        "x-api-key": "<secret>",
+        "sessionId": "<secret>",
+        "status": 401,
+    }
+    assert "hunter2" not in (log_dir / CLIENT_LOG_NAME).read_text()
+
+
 def test_a_frame_after_a_credential_word_is_kept(client, log_dir):
     """A message ending in "cookie:" doesn't eat the next line's frame."""
     exc = (

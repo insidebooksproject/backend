@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from ibp.scrub import scrub_secrets
+from ibp.scrub import is_credential_key, scrub_secrets
 
 
 @pytest.mark.parametrize(
@@ -96,3 +96,46 @@ def test_a_quoted_value_with_escaped_quotes_is_replaced_whole():
 def test_stack_frames_survive(text, expected):
     """Frames' "at", file:line:col suffixes and URL paths are kept."""
     assert scrub_secrets(text) == expected
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "password",
+        "PASSWORD",
+        "passwd",
+        "passphrase",
+        "pwd",
+        "secret",
+        "client_secret",
+        "token",
+        "access_token",
+        "refreshToken",
+        "api_key",
+        "apiKey",
+        "apikey",
+        "api-key",
+        "x-api-key",
+        "X-API-Key",
+        "auth",
+        "authorization",
+        "cookie",
+        "cookies",
+        "session",
+        "sessionId",
+        "credential",
+        "credentials",
+        "signature",
+    ],
+)
+def test_credential_keys(key):
+    """Each credential name, prefixed, camel-cased or plural."""
+    assert is_credential_key(key)
+
+
+@pytest.mark.parametrize(
+    "key", ["url", "status", "detail", "package", "operation", "author", "key", "upc"]
+)
+def test_other_keys(key):
+    """Keys that don't name a credential, ``key`` alone among them."""
+    assert not is_credential_key(key)
