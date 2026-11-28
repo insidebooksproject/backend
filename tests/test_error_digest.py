@@ -177,10 +177,19 @@ def groups_by_app(report):
     [
         ("package TEX-01234567-2 failed", "package TEX-01234567-2 failed"),
         ("mail jane@example.org bounced", "mail <email> bounced"),
-        ("printer \"BOB\" offline and 'BETTY' too", "printer \"BOB\" offline and 'BETTY' too"),
-        ("lookup failed for inmate Jane Q Example", "lookup failed for inmate Jane Q Example"),
+        (
+            "printer \"BOB\" offline and 'BETTY' too",
+            "printer \"BOB\" offline and 'BETTY' too",
+        ),
+        (
+            "lookup failed for inmate Jane Q Example",
+            "lookup failed for inmate Jane Q Example",
+        ),
         ("bad address: 4521 Fake Street", "bad address: 4521 Fake Street"),
-        ("tracking 9400111202555842761234 stuck", "tracking 9400111202555842761234 stuck"),
+        (
+            "tracking 9400111202555842761234 stuck",
+            "tracking 9400111202555842761234 stuck",
+        ),
         ("retry 3 of 5 in 120 s", "retry 3 of 5 in 120 s"),
         ("two\nlines\there", "two lines here"),
     ],
@@ -199,8 +208,11 @@ def test_redact_keeps_messages_short_and_ignores_non_text():
     "a, b",
     [
         ("package TEX-01234567-2 failed", "package TEX-07654321-0 failed"),
-        ("printer \"BOB\" offline", "printer \"BETTY\" offline"),
-        ("lookup failed for inmate Jane Q Example", "lookup failed for inmate John Doe"),
+        ('printer "BOB" offline', 'printer "BETTY" offline'),
+        (
+            "lookup failed for inmate Jane Q Example",
+            "lookup failed for inmate John Doe",
+        ),
         ("bad address: 4521 Fake Street", "bad address: 12 Other Rd"),
         ("TEX-01234567-2 name Jane", "TEX-00000001-1 name Bob Smith"),
     ],
