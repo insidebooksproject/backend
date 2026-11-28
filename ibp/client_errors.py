@@ -5,20 +5,23 @@ each error here as one event of the shared format without ``ts`` and
 ``host``; the backend adds both and appends the event to
 ``client-errors.jsonl`` (``ibp/error_log.py``).
 
-- The body is at most 16 KiB (larger is a 413) and must be strict JSON
-  (no NaN or Infinity, no number out of range) and a valid event (else a
-  422 naming only the fields and error types, never what was sent);
-  ``app`` is ``frontend`` or ``book-portal-extension``.
+- The body must be ``application/json`` (else a 415), at most 16 KiB
+  (larger is a 413), strict JSON (no NaN or Infinity, no number out of
+  range) and a valid event (else a 422 naming only the fields and error
+  types, never what was sent). ``app`` is ``frontend`` or
+  ``book-portal-extension``; ``level`` is WARNING, ERROR or CRITICAL.
 - What is kept is bounded: ``msg`` and ``exc`` are cut to
   ``MAX_MSG_CHARS`` and ``MAX_EXC_CHARS``; ``data`` keeps at most
   ``MAX_DATA_KEYS`` keys with scalar values (or short lists of them),
   strings cut to ``MAX_DATA_TEXT_CHARS``, and ``data.url`` and
   ``data.source`` lose any query string or fragment.
-- ``host`` is the client address nginx passes in ``X-Real-IP`` (the
-  connection's address without it).
-- At most 30 reports a minute are taken from one address. Over that they
-  are dropped with a 429, and one WARNING per address and minute says how
-  many were.
+- ``host`` is the client address nginx passes in ``X-Real-IP`` when the
+  connection comes from a trusted proxy (``[server] trusted_proxies``:
+  loopback and Docker's private ranges by default), else the connection's
+  own address.
+- At most 30 reports a minute are taken from one address, and 300 from all
+  of them. Over that they are dropped with a 429, and one WARNING per
+  address (or for all of them) and minute says how many were.
 - A report that can't be written once the file is open (a full disk, a
   failed rotation) is a 503.
 """
@@ -32,7 +35,7 @@ import re
 import time
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from fastapi import Request, Response, status
@@ -40,13 +43,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from pydantic_core import from_json
 from starlette.concurrency import run_in_threadpool
 
-from .base import app
+from .base import app, config
 from .error_log import WriteFailed, client_error_log, timestamp
 
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 16 * 1024
 RATE_LIMIT = 30
+GLOBAL_RATE_LIMIT = 300
 RATE_WINDOW_S = 60.0
 
 MAX_MSG_CHARS = 1024
@@ -62,7 +66,9 @@ MAX_SAFE_INTEGER = 2**53 - 1
 # string or fragment, which can hold inmate numbers.
 URL_KEYS = frozenset({"url", "source"})
 
-Level = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8, ::1, 172.16.0.0/12"
+
+Level = Literal["WARNING", "ERROR", "CRITICAL"]
 Scalar = str | int | float | bool | None
 
 
@@ -222,38 +228,46 @@ class _Window:
     dropped: int = 0
 
 
+@dataclass
 class RateLimiter:
-    """At most ``limit`` reports per address in each ``window_s`` window.
+    """At most ``limit`` reports per address, and ``global_limit`` from all
+    addresses, in each ``window_s`` window.
 
-    Each address's window starts at its first report. When a window that
-    dropped reports ends, one WARNING says how many: on the next report
-    from any address, or from a timer set at the first drop, whichever
-    comes first.
+    Each window starts at its first report. When a window that dropped
+    reports ends, one WARNING says how many: on the next report from any
+    address, or from a timer set at the first drop, whichever comes first.
+    A report one address may send but the global window has no room for is
+    counted as the global window's drop.
     """
 
-    def __init__(
-        self,
-        limit: int = RATE_LIMIT,
-        window_s: float = RATE_WINDOW_S,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self.limit = limit
-        self.window_s = window_s
-        self.clock = clock
-        self._windows: dict[str, _Window] = {}
+    limit: int = RATE_LIMIT
+    window_s: float = RATE_WINDOW_S
+    clock: Callable[[], float] = time.monotonic
+    global_limit: int = GLOBAL_RATE_LIMIT
+    _windows: dict[str, _Window] = field(default_factory=dict, init=False)
+    _global: _Window | None = field(default=None, init=False)
 
     def allow(self, address: str) -> bool:
-        """Count a report from ``address``; False if it is over the limit."""
+        """Count a report from ``address``; False if it is over a limit."""
         now = self.clock()
         self.flush(now)
         window = self._windows.setdefault(address, _Window(start=now))
-        if window.count < self.limit:
-            window.count += 1
-            return True
+        if self._global is None:
+            self._global = _Window(start=now)
+        if window.count >= self.limit:
+            self._drop(window, now)
+            return False
+        if self._global.count >= self.global_limit:
+            self._drop(self._global, now)
+            return False
+        window.count += 1
+        self._global.count += 1
+        return True
+
+    def _drop(self, window: _Window, now: float) -> None:
         window.dropped += 1
         if window.dropped == 1:
             self._schedule_flush(window.start + self.window_s - now)
-        return False
 
     def flush(self, now: float | None = None) -> None:
         """Forget ended windows, reporting the drops of each."""
@@ -274,6 +288,16 @@ class RateLimiter:
                     self.limit,
                     extra={"data": {"address": address, "dropped": window.dropped}},
                 )
+        if self._global is not None and now - self._global.start >= self.window_s:
+            dropped, self._global = self._global.dropped, None
+            if dropped:
+                logger.warning(
+                    "dropped %d client error reports from all addresses over "
+                    "the limit of %d a minute",
+                    dropped,
+                    self.global_limit,
+                    extra={"data": {"address": "all", "dropped": dropped}},
+                )
 
     def _schedule_flush(self, delay: float) -> None:
         try:
@@ -285,16 +309,59 @@ class RateLimiter:
 
 rate_limiter = RateLimiter()
 
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def get_trusted_proxies() -> list[IPNetwork]:
+    """The networks whose connections may set the client address with
+    ``X-Real-IP``: ``[server] trusted_proxies`` (comma or whitespace
+    separated addresses or networks). An entry that isn't one is skipped
+    with a WARNING."""
+    value = config.get("server", "trusted_proxies", fallback=DEFAULT_TRUSTED_PROXIES)
+    networks = []
+    for entry in re.split(r"[,\s]+", value):
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            logger.warning("ignoring trusted_proxies entry %r: not a network", entry)
+    return networks
+
+
+trusted_proxies = get_trusted_proxies()
+
+
+def parse_address(text: str) -> IPAddress | None:
+    """``text`` as an address (an IPv4-mapped IPv6 one as IPv4), or None."""
+    try:
+        address = ipaddress.ip_address(text.strip())
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
 
 def client_address(request: Request) -> str:
-    """The client's address: nginx's ``X-Real-IP``, else the connection's."""
-    header = request.headers.get("x-real-ip", "").strip()
-    if header:
-        try:
-            return str(ipaddress.ip_address(header))
-        except ValueError:
-            pass
-    return request.client.host if request.client else "unknown"
+    """The client's address: nginx's ``X-Real-IP`` if the connection is
+    from a trusted proxy, else the connection's own."""
+    peer = request.client.host if request.client else ""
+    peer_address = parse_address(peer)
+    if peer_address is None:
+        return peer or "unknown"
+    if any(peer_address in network for network in trusted_proxies):
+        forwarded = parse_address(request.headers.get("x-real-ip", ""))
+        if forwarded is not None:
+            return str(forwarded)
+    return str(peer_address)
+
+
+def is_json(request: Request) -> bool:
+    """Whether the body is declared ``application/json`` (any parameters)."""
+    media_type = request.headers.get("content-type", "").split(";", 1)[0]
+    return media_type.strip().lower() == "application/json"
 
 
 async def read_body(request: Request) -> bytes | None:
@@ -339,6 +406,11 @@ def json_response(status_code: int, content: dict[str, Any]) -> Response:
 async def report_client_error(request: Request) -> Response:
     """Record one error from the browser code (frontend, extension)."""
     received = time.time()
+    if not is_json(request):
+        return json_response(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            {"detail": "Report must be application/json."},
+        )
     address = client_address(request)
     if not rate_limiter.allow(address):
         return Response(status_code=status.HTTP_429_TOO_MANY_REQUESTS)

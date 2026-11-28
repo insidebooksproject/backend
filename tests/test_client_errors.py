@@ -19,6 +19,8 @@ from ibp.base import app
 from ibp.error_log import CLIENT_LOG_NAME, client_error_log
 
 TS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d$")
+# nginx in the frontend container, on the stack's Docker network.
+PROXY = ("172.18.0.3", 40000)
 JSON = {"Content-Type": "application/json"}
 INVALID = {"detail": "Invalid report."}
 
@@ -63,8 +65,14 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
 
 @pytest.fixture
 def client(log_dir, clock) -> TestClient:  # pylint: disable=unused-argument
-    """Client without the lifespan; the file opens on the first report."""
-    return TestClient(app)
+    """Client without the lifespan, connecting from nginx's address; the
+    file opens on the first report."""
+    return TestClient(app, client=PROXY)
+
+
+def direct(address: str) -> TestClient:
+    """A client connecting from ``address`` itself, not through nginx."""
+    return TestClient(app, client=(address, 50000))
 
 
 def report(**fields) -> dict:
@@ -143,7 +151,97 @@ def test_host_without_x_real_ip_is_the_connection(client, log_dir):
     """Without nginx's header (or with a bad one) the peer address is used."""
     client.post("/client-errors", json=report())
     client.post("/client-errors", json=report(), headers={"X-Real-IP": "not an ip"})
-    assert [event["host"] for event in events(log_dir)] == ["testclient"] * 2
+    assert [event["host"] for event in events(log_dir)] == [PROXY[0]] * 2
+
+
+@pytest.mark.parametrize(
+    "peer, expected",
+    [
+        # A tailnet or LAN client reaching the backend directly can't name
+        # another address.
+        ("100.65.137.125", "100.65.137.125"),
+        ("192.168.1.26", "192.168.1.26"),
+        # Not an address at all (Starlette's test client).
+        ("testclient", "testclient"),
+    ],
+)
+def test_x_real_ip_from_an_untrusted_peer_is_ignored(
+    log_dir, clock, peer, expected
+):  # pylint: disable=unused-argument
+    """Only a trusted proxy's X-Real-IP is believed."""
+    response = direct(peer).post(
+        "/client-errors", json=report(), headers={"X-Real-IP": "10.9.9.9"}
+    )
+    assert response.status_code == 204
+    assert [event["host"] for event in events(log_dir)] == [expected]
+
+
+@pytest.mark.parametrize("peer", ["127.0.0.1", "::1", "::ffff:172.20.0.2"])
+def test_x_real_ip_from_loopback_and_docker_is_used(
+    log_dir, clock, peer
+):  # pylint: disable=unused-argument
+    """Loopback and Docker's private range (an IPv4-mapped one too) are
+    trusted by default."""
+    response = direct(peer).post(
+        "/client-errors", json=report(), headers={"X-Real-IP": "100.120.251.0"}
+    )
+    assert response.status_code == 204
+    assert [event["host"] for event in events(log_dir)] == ["100.120.251.0"]
+
+
+def test_trusted_proxies_from_config(monkeypatch, caplog):
+    """[server] trusted_proxies lists addresses or networks; a bad entry is
+    skipped with a WARNING."""
+    caplog.set_level(logging.WARNING, logger="ibp.client_errors")
+    monkeypatch.setitem(
+        client_errors.config["server"],
+        "trusted_proxies",
+        "10.0.0.0/8, nope 192.168.1.5",
+    )
+    assert [str(net) for net in client_errors.get_trusted_proxies()] == [
+        "10.0.0.0/8",
+        "192.168.1.5/32",
+    ]
+    assert "ignoring trusted_proxies entry 'nope'" in caplog.text
+
+
+def test_a_proxy_left_out_of_trusted_proxies_is_not_believed(
+    log_dir, clock, monkeypatch
+):  # pylint: disable=unused-argument
+    """With the list emptied, even nginx's header is ignored."""
+    monkeypatch.setattr(client_errors, "trusted_proxies", [])
+    TestClient(app, client=PROXY).post(
+        "/client-errors", json=report(), headers={"X-Real-IP": "100.120.251.0"}
+    )
+    assert [event["host"] for event in events(log_dir)] == [PROXY[0]]
+
+
+@pytest.mark.parametrize(
+    "content_type", [None, "text/plain", "application/x-www-form-urlencoded"]
+)
+def test_body_not_declared_json_is_415(client, log_dir, clock, content_type):
+    """A simple cross-origin request (text/plain, a form) is refused, and
+    doesn't use up the sender's allowance."""
+    headers = {"Content-Type": content_type} if content_type else {}
+    for _ in range(client_errors.RATE_LIMIT + 1):
+        response = client.post(
+            "/client-errors", content=json.dumps(report()), headers=headers
+        )
+        assert response.status_code == 415
+        assert response.json() == {"detail": "Report must be application/json."}
+    assert not events(log_dir)
+    assert client.post("/client-errors", json=report()).status_code == 204
+
+
+def test_json_with_a_charset_is_taken(client, log_dir):
+    """application/json with parameters, in any case, is JSON."""
+    response = client.post(
+        "/client-errors",
+        content=json.dumps(report()),
+        headers={"Content-Type": "Application/JSON; charset=utf-8"},
+    )
+    assert response.status_code == 204
+    assert len(events(log_dir)) == 1
 
 
 def test_what_the_browser_apps_send_is_taken(client, log_dir):
@@ -179,13 +277,16 @@ def test_what_the_browser_apps_send_is_taken(client, log_dir):
         report(app="backend"),
         report(app="shippy"),
         report(level="LOUD"),
+        report(level="DEBUG"),
+        report(level="info"),
         report(msg=None),
         report(data=["not", "an", "object"]),
         ["not an object"],
     ],
 )
 def test_invalid_report_is_422(client, log_dir, body):
-    """An app other than the browser ones, or a malformed event, is refused."""
+    """An app other than the browser ones, a level below WARNING, or a
+    malformed event, is refused."""
     response = client.post("/client-errors", json=body)
     assert response.status_code == 422
     assert response.json()["detail"] == INVALID["detail"]
@@ -442,6 +543,40 @@ def test_rate_limit_per_address(client, log_dir, clock, caplog):
         "30 a minute"
     )
     assert len(events(log_dir)) == 32
+
+
+def test_global_rate_limit(caplog):
+    """At most global_limit reports a minute from all addresses together;
+    the drops are one WARNING of their own."""
+    caplog.set_level(logging.WARNING, logger="ibp.client_errors")
+    clock = FakeClock()
+    limiter = client_errors.RateLimiter(
+        limit=2, global_limit=3, window_s=60, clock=clock
+    )
+    allowed = [limiter.allow(address) for address in "aabbcc"]
+    assert allowed == [True, True, True, False, False, False]
+    assert not drops(caplog)
+    clock.now += 60
+    assert limiter.allow("c")
+    assert [record.getMessage() for record in drops(caplog)] == [
+        "dropped 3 client error reports from all addresses over the limit of 3 "
+        "a minute"
+    ]
+
+
+def test_global_rate_limit_at_the_endpoint(client, log_dir):
+    """300 a minute from all addresses by default; more is a 429."""
+    assert client_errors.GLOBAL_RATE_LIMIT == 300
+    limiter = client_errors.rate_limiter
+    limiter.global_limit = 4
+    statuses = [
+        client.post(
+            "/client-errors", json=report(), headers={"X-Real-IP": f"10.0.0.{i}"}
+        ).status_code
+        for i in range(6)
+    ]
+    assert statuses == [204] * 4 + [429] * 2
+    assert len(events(log_dir)) == 4
 
 
 def test_rate_limiter_reports_each_window_once(caplog):
