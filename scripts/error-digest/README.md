@@ -107,8 +107,12 @@ no raw path.
 request body or raw line is ever copied. In each message and exception
 line: secrets become `<secret>` (a URL's `user:password@`, `Bearer`/`Basic`
 credentials, the value of `key=`, `token=`, `password:` and the like, JWTs,
-and runs of 24 or more base64/hex characters with letters and digits);
-and e-mail addresses become `<email>`. Inmate names, TDCJ numbers, unit
+runs of 24 or more of `A-Z a-z 0-9 _ + = -` with two capitals, two small
+letters and two digits, and runs of 32 or more mixed hex digits); and
+e-mail addresses become `<email>`. The same secret patterns then run over
+every other string the digest writes, in the `.md`, the `.json` and
+`seen.json` (file and function names in frames, loggers, apps, hosts,
+labels), and a raw path that would need one gets no `raw_event`. Inmate names, TDCJ numbers, unit
 addresses, quoted text and package codes are kept: they are largely public
 and help find a cause (jstarr, 2026-11-28). Fingerprints still replace
 codes, quoted text, numbers and what follows `address`, `name` or `inmate`,

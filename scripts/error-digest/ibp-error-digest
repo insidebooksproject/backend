@@ -173,8 +173,8 @@ QUOTED = re.compile(
 KEYWORD = re.compile(r"\w*(?:address|name|inmate)\w*", re.I)
 DIGITS = re.compile(r"\d{4,}")
 # Secrets: a URL's user and password, an Authorization scheme's credentials,
-# the value of a key=, token=, password: ... pair, and any long run of
-# base64 or hex with both letters and digits in it (API keys, JWT parts).
+# the value of a key=, token=, password: ... pair, a JWT, and a long random
+# run of characters (TOKEN).
 USERINFO = re.compile(r"(?<=://)[^\s/@]+@")
 AUTH_SCHEME = re.compile(r"\b(?P<scheme>Bearer|Basic|Token)\s+[\w.~+/=-]{8,}", re.I)
 SECRET_PAIR = re.compile(
@@ -184,8 +184,16 @@ SECRET_PAIR = re.compile(
     re.I,
 )
 JWT = re.compile(r"\beyJ[\w-]+\.[\w-]+(?:\.[\w-]+)?", re.A)
+# A token: 24 or more of [A-Za-z0-9_+=-] with at least two capitals, two
+# small letters and two digits (an API key, not a path or a snake_case name;
+# "/" splits a run, so a path is never one token), or 32 or more hex digits
+# with two of each kind (a hex key or hash). A UUID is none of these.
 TOKEN = re.compile(
-    r"(?<![\w+/=-])(?=[\w+/=-]*\d)(?=[\w+/=-]*[A-Za-z])[\w+/=-]{24,}(?![\w+/=-])",
+    r"(?<![\w+=-])"
+    r"(?=(?:[\w+=-]*?[A-Z]){2})(?=(?:[\w+=-]*?[a-z]){2})(?=(?:[\w+=-]*?\d){2})"
+    r"[\w+=-]{24,}(?![\w+=-])"
+    r"|(?<![\w+=-])(?=(?:[0-9a-fA-F]*?\d){2})(?=(?:[0-9a-fA-F]*?[a-fA-F]){2})"
+    r"[0-9a-fA-F]{32,}(?![\w+=-])",
     re.A,
 )
 
@@ -223,18 +231,36 @@ def redact(text: Any, limit: int = MAX_TEXT) -> str:
         text = text[:MAX_SCAN]
         space = max(text.rfind(c) for c in " \t\n")
         text = text[:space] if space > 0 else text
-    # A lone surrogate (an escaped one passes json.loads) can't be written.
-    text = text.encode("utf-8", "replace").decode("utf-8")
-    out = USERINFO.sub("<secret>@", text)
-    out = AUTH_SCHEME.sub(lambda m: f"{m['scheme']} <secret>", out)
-    out = SECRET_PAIR.sub(lambda m: f"{m['key']}{m['sep']}<secret>", out)
-    out = JWT.sub("<secret>", out)
-    out = TOKEN.sub("<secret>", out)
-    out = EMAIL.sub("<email>", out)
+    out = EMAIL.sub("<email>", scrub(text))
     out = " ".join(out.split())
     if len(out) > limit:
         out = out[: limit - 3].rstrip() + "..."
     return out
+
+
+def scrub(text: str) -> str:
+    """``text`` with its secrets replaced (and any lone surrogate, which
+    can't be written): for every piece of text the digest writes, not only
+    messages, e.g. a token in a script's file name."""
+    # A lone surrogate (an escaped one passes json.loads) can't be written.
+    out = text.encode("utf-8", "replace").decode("utf-8")
+    out = USERINFO.sub("<secret>@", out)
+    out = AUTH_SCHEME.sub(lambda m: f"{m['scheme']} <secret>", out)
+    out = SECRET_PAIR.sub(lambda m: f"{m['key']}{m['sep']}<secret>", out)
+    out = JWT.sub("<secret>", out)
+    return TOKEN.sub("<secret>", out)
+
+
+def scrub_tree(value: Any) -> Any:
+    """``value`` (a report or state: dicts, lists, strings, numbers) with
+    every string in it, dictionary keys too, passed through ``scrub``."""
+    if isinstance(value, str):
+        return scrub(value)
+    if isinstance(value, dict):
+        return {scrub_tree(k): scrub_tree(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_tree(v) for v in value]
+    return value
 
 
 def normalize(redacted: str) -> str:
@@ -564,7 +590,10 @@ def beneath(path: Path, roots: tuple[Path, ...]) -> tuple[Path, list[str]] | Non
 
 
 def raw_source(path: Path, number: int, roots: tuple[Path, ...]) -> str:
-    return f"{path}:{number}" if beneath(path, roots) else ""
+    """``path:number``, if --show-raw takes the path and it holds no secret
+    (``scrub`` would change it), else ""."""
+    raw = f"{path}:{number}"
+    return raw if beneath(path, roots) and scrub(raw) == raw else ""
 
 
 def open_beneath(root: Path, parts: list[str]) -> int:
@@ -1818,14 +1847,18 @@ def digest(
     seen = load_seen(seen_path, run.problems)
     groups = group_events(run.events)
     gone = compare(groups, seen, week, last_week)
-    report = build_report(
-        run,
-        groups,
-        gone,
-        muted,
-        week,
-        deploy_versions(fetch),
-        read_release(opts.env_file),
+    # Messages are redacted as they are read; this catches a secret in any
+    # other text (a file or function name, a logger, an app, a host).
+    report = scrub_tree(
+        build_report(
+            run,
+            groups,
+            gone,
+            muted,
+            week,
+            deploy_versions(fetch),
+            read_release(opts.env_file),
+        )
     )
     markdown = render_markdown(report)
     if opts.dry_run:
@@ -1842,7 +1875,10 @@ def digest(
         # An incomplete week isn't recorded: its missing groups would be
         # "gone" now and its low counts make next week's look "growing".
         opts.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        state = {"version": 1, "fingerprints": update_seen(seen, groups, week, oldest)}
+        state = {
+            "version": 1,
+            "fingerprints": scrub_tree(update_seen(seen, groups, week, oldest)),
+        }
         atomic_write(seen_path, json.dumps(state, indent=1) + "\n", 0o600, None)
     prune_digests(digest_dir, oldest_monday)
     return (1 if run.failed else 0), report, markdown

@@ -1315,7 +1315,10 @@ def test_open_beneath_walks_each_component_without_symlinks(tree, tmp_path):
         ("got https://user:pw@hc.example/ping", "got https://<secret>@hc.example/ping"),
         ("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIzNDU2",
          "jwt <secret>"),
-        ("id 32b5a86d-ba4a-4756-a001-b51000629787 gone", "id <secret> gone"),
+        ("id 32b5a86d-ba4a-4756-a001-b51000629787 gone", "id 32b5a86d-ba4a-4756-a001-b51000629787 gone"),
+        ("hash 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "hash <secret>"),
+        ("path IBP_KIOSK1/ibp-bilbo/journal/failed-units-2026-11-26", "path IBP_KIOSK1/ibp-bilbo/journal/failed-units-2026-11-26"),
+        ("test_bad_lines_and_field_types_are_unreadable_not_fatal0", "test_bad_lines_and_field_types_are_unreadable_not_fatal0"),
         ("KeyError: isbn", "KeyError: isbn"),
         ("shippy.gui.workers.shipment_worker failed", "shippy.gui.workers.shipment_worker failed"),
     ],
@@ -1688,3 +1691,33 @@ def test_launcher_tracebacks_are_one_event_with_frames(tree):
     assert slow["count"] == 2
     assert slow["frames"] == ["ibp_kiosk/app.py:140 watch"]
     assert len(report["groups"]) == 2
+
+
+TOKEN_NAME = "ghp_Ab12Cd34Ef56Gh78Ij90Kl12Mn34"
+
+
+def test_a_secret_in_a_name_never_reaches_the_digest_or_the_state(tree):
+    script = f"/usr/local/bin/ibp-sync-{TOKEN_NAME}"
+    exc = (
+        "Traceback (most recent call last):\n"
+        f'  File "{script}", line 3, in {TOKEN_NAME}\n'
+        "    main()\n"
+        "RuntimeError: sync failed\n"
+    )
+    base = tree["root"] / "IBP_LAPTOP"
+    write_jsonl(
+        base / f"errors-{TOKEN_NAME}.jsonl",
+        [
+            event(NOW - timedelta(hours=1), exc=exc, logger=TOKEN_NAME),
+            event(NOW - timedelta(hours=2), msg="other", app=TOKEN_NAME),
+        ],
+    )
+    _, report, _ = run(tree)
+    assert report["summary"]["events"] == 2
+    # Named as a raw event, the path would hold the token: no raw path.
+    assert {g["raw_event"] for g in report["groups"]} == {None}
+    frames = [f for g in report["groups"] for f in g["frames"]]
+    assert "<secret>:3 <secret>" in frames
+    for name in ("2026-W48.md", "2026-W48.json"):
+        assert TOKEN_NAME not in (tree["digest"] / name).read_text()
+    assert TOKEN_NAME not in (tree["state"] / "seen.json").read_text()
