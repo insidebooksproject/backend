@@ -200,3 +200,17 @@ def test_a_scheme_does_not_take_the_next_line():
 def test_a_value_is_replaced_with_its_digits(text, expected):
     """No ``:line:col`` is split off a credential value, in a frame or not."""
     assert scrub_secrets(text) == expected
+
+
+@pytest.mark.parametrize("separator", ["\r", "\r\n", "\n", " ", " "])
+def test_each_line_is_scrubbed_on_its_own(separator):
+    """An unclosed quoted value ends with its line, whatever ends it, and
+    the separators are kept as they were."""
+    text = f'password: \\"letmein{separator}diagnostic "new details"'
+    assert scrub_secrets(text) == (
+        f'password: <secret>{separator}diagnostic "new details"'
+    )
+    text = f"missing cookie:{separator}    at renderRows (http://ibp-server/a.js:1:2)"
+    assert scrub_secrets(text) == text
+    text = f"token=abc{separator}token=def{separator}"
+    assert scrub_secrets(text) == f"token=<secret>{separator}token=<secret>{separator}"

@@ -18,9 +18,10 @@ index-DkS8f3jK.js``, ``python3.13/site-packages``) are never taken for a
 token. A base64 secret with a ``/`` in it is still caught by its key
 (``key=``, ``Bearer``) where it has one.
 
-No pattern crosses a line, so a key at the end of one line (``missing
-cookie:``) never takes the next one (a stack frame's ``at ...``) as its
-value. Every line is scrubbed the same way, stack frames too: a value is
+Text is scrubbed a line at a time (CRLF, CR, LF, U+2028 and U+2029 all end
+one), so a key at the end of one line (``missing cookie:``) never takes the
+next one (a stack frame's ``at ...``) as its value, and a quoted value
+never runs into the next line. Every line is scrubbed the same way, stack frames too: a value is
 replaced whole, digits after it included (``token=example:123:456`` is
 ``token=<secret>``, in a frame's URL as anywhere).
 """
@@ -103,8 +104,23 @@ def is_credential_key(key: str) -> bool:
     return any(word in CREDENTIAL_WORDS for word in words) or "apikey" in pairs
 
 
+# Line separators: CRLF, CR, LF and Unicode's line and paragraph
+# separators. The patterns are applied to each line on its own, so none
+# (a quoted value in particular) can run from one line into the next.
+LINE_BREAK = re.compile("(\r\n|[\r\n\u2028\u2029])")
+
+
 def scrub_secrets(text: str) -> str:
-    """``text`` with each secret the patterns find replaced by ``<secret>``."""
+    """``text`` with each secret the patterns find replaced by ``<secret>``,
+    a line at a time (the line separators kept as they were)."""
+    parts = LINE_BREAK.split(text)
+    # Even indexes are lines, odd ones the separators between them.
+    return "".join(
+        part if index % 2 else _scrub_line(part) for index, part in enumerate(parts)
+    )
+
+
+def _scrub_line(text: str) -> str:
     out = USERINFO.sub(f"{SECRET}@", text)
     out = CREDENTIAL_PATH.sub(lambda m: f"{m['prefix'] or m['slack']}{SECRET}", out)
     out = AUTH_SCHEME.sub(lambda m: f"{m['scheme']} {SECRET}", out)
