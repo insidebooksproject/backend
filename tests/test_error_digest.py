@@ -1541,6 +1541,8 @@ def test_versions_compare_the_base_and_list_the_weeks_commits(tree):
             shippy_starting(NOW - timedelta(days=10), "shippy", "0.2.0+g1111111"),
             shippy_starting(NOW - timedelta(days=3), "shippy", "0.2.0+g9a886e3"),
             shippy_starting(NOW - timedelta(days=2), "shippy", "0.2.0+gb8ac3af"),
+            # Started after the window's end (a late run): not this week's.
+            shippy_starting(NOW + timedelta(hours=3), "shippy", "0.2.0+gcccccc0"),
         ],
     )
     write_jsonl(
@@ -1550,7 +1552,7 @@ def test_versions_compare_the_base_and_list_the_weeks_commits(tree):
     _, report, markdown = run(tree)
     versions = {v["app"]: v for v in report["versions"]}
     assert versions["shippy"]["status"] == "current"
-    assert versions["shippy"]["version"] == "0.2.0+gb8ac3af"
+    assert versions["shippy"]["version"] == "0.2.0+gcccccc0"  # the latest start
     assert versions["shippy"]["commits"] == ["9a886e3", "b8ac3af"]
     assert versions["shippy-gui"]["status"] == "old"
     assert "| 9a886e3, b8ac3af |" in markdown
@@ -1770,3 +1772,13 @@ def test_a_secret_in_a_name_never_reaches_the_digest_or_the_state(tree):
     for name in ("2026-W48.md", "2026-W48.json"):
         assert TOKEN_NAME not in (tree["digest"] / name).read_text()
     assert TOKEN_NAME not in (tree["state"] / "seen.json").read_text()
+
+
+def test_failed_units_now_are_shown_at_the_time_they_were_seen(tree):
+    late = NOW + timedelta(days=1, hours=2)  # a Friday run (Persistent=)
+    system = FakeSystem(failed=["ibp-label-refund.service"])
+    _, report, _ = run(tree, now=late, system=system)
+    (group,) = report["groups"]
+    assert group["message"] == "unit failed: ibp-label-refund.service"
+    assert group["last_seen"] == digest.iso(late)
+    assert report["window"]["until"] == digest.iso(NOW)

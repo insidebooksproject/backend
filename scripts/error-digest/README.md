@@ -33,7 +33,7 @@ kiosk's as from its host.
 | `<station>/<host>/journal/failed-units-<day>.jsonl` | the units failed at the kiosk's last upload that day (UTC), rewritten at every upload; empty or missing when none is. One journal-shaped line per unit: `SYSLOG_IDENTIFIER` `ibp-kiosk-log-upload`, `PRIORITY` `3`, `MESSAGE` `<unit> failed`, `UNIT` (system) or `USER_UNIT` (the kiosk user's), `__REALTIME_TIMESTAMP`. Each becomes one event a day, app `systemd`, `unit failed: <unit>` or `user unit failed: <unit>`, so a unit that stays failed counts every day the station runs |
 | the same folders' `{printer,errors}-*.jsonl` | only the `<app> starting` lines (`shippy starting`, `label watcher starting`), and of those only `ts`, `app`, `host` and the version (`version`, or `data.version`), for each station's (a kiosk: each host's) app versions. The print server's starting line has no version |
 | `/srv/ibp/logs/*.jsonl` | `backend.jsonl` (host `ibp-server`) and `client-errors.jsonl` (host: the client address, named by `/etc/ibp-error-digest/hosts`) |
-| `journalctl -u 'ibp-*' -p warning` | the Pi's own jobs (backup, refunds, sync, this one), and `systemctl --failed` |
+| `journalctl -u 'ibp-*' -p warning` | the Pi's own jobs (backup, refunds, sync, this one), and `systemctl --failed`: a snapshot when the digest runs, shown at that time (after the window's end if the run is late) |
 
 The week is half-open, from the Thursday 09:00 America/Chicago before last
 to the latest one at or before the run (`since <= ts < until`): a run late
@@ -93,7 +93,8 @@ no raw path.
    can't be) or the release's `IBP_TAG` (backend, frontend, extension).
    Only the base version is compared (`0.1.0+g9a886e3` is `0.1.0`), so it
    is `old` only when the package version is behind; `commits` lists the
-   commits (`+g<sha>`) of the week's starts, to compare with the `deploy`
+   commits (`+g<sha>`) of the starts within the week's window, to compare
+   with the `deploy`
    branch's commit (`/ibp-errors` does).
 5. **The report**'s first line says whether there are new or growing
    groups. Each group has its status, app, highest level, count, hosts,

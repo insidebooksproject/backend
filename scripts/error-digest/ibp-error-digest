@@ -966,7 +966,9 @@ def read_starting_lines(
                 if raw is None or b"starting" not in raw:
                     continue
                 with contextlib.suppress(Exception):
-                    starting_line(load_json(raw), station, where_app, run.since)
+                    starting_line(
+                        load_json(raw), station, where_app, (run.since, run.until)
+                    )
     except OSError:
         run.fail(f"{label}: could not be read to the end")
 
@@ -983,7 +985,10 @@ def version_commit(version: str) -> str | None:
 
 
 def starting_line(
-    obj: Any, station: Station, where_app: tuple[str, str], since: datetime
+    obj: Any,
+    station: Station,
+    where_app: tuple[str, str],
+    window: tuple[datetime, datetime],
 ) -> None:
     if not isinstance(obj, dict) or not isinstance(obj.get("msg"), str):
         return
@@ -1005,7 +1010,7 @@ def starting_line(
     if current is None or ts > current[0]:
         station.versions[key] = (ts, version)
     commit = version_commit(version)
-    if commit and ts >= since:
+    if commit and window[0] <= ts < window[1]:
         station.commits.setdefault(key, set()).add(commit)
 
 
@@ -1193,11 +1198,12 @@ def read_pi_journal(run: Run, command: Command) -> None:
         words = line.split()
         failed_name = clean_name(words[0].lstrip("●*")) if words else None
         if failed_name:
-            # Failed now, as of the window's end: counted whatever the time.
+            # A live snapshot: failed when this run looked (which may be
+            # after the window's end), so it is shown at that time.
             run.events.append(
                 failed_unit_event(
                     failed_name,
-                    run.until,
+                    run.generated or run.until,
                     "ibp-server",
                     f"systemctl status {failed_name}",
                 )
