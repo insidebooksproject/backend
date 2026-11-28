@@ -213,6 +213,13 @@ def test_existing_log_file_is_made_0640(
     assert path.read_text() == '{"old": 1}\n'
 
 
+def test_event_formatter_writes_strict_json():
+    """A NaN or Infinity can't become a nonstandard line."""
+    item = logging.makeLogRecord({"event": {"msg": "x", "n": float("nan")}})
+    with pytest.raises(ValueError):
+        error_log.EventFormatter().format(item)
+
+
 def test_engines_hide_parameters():
     """Database errors (and their tracebacks) leave the values out."""
     # pylint: disable=import-outside-toplevel

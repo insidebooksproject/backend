@@ -19,6 +19,8 @@ from ibp.base import app
 from ibp.error_log import CLIENT_LOG_NAME, client_error_log
 
 TS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d$")
+JSON = {"Content-Type": "application/json"}
+INVALID = {"detail": "Invalid report."}
 
 
 @pytest.fixture(autouse=True)
@@ -144,6 +146,33 @@ def test_host_without_x_real_ip_is_the_connection(client, log_dir):
     assert [event["host"] for event in events(log_dir)] == ["testclient"] * 2
 
 
+def test_what_the_browser_apps_send_is_taken(client, log_dir):
+    """The frontend's and the extension's reports as they build them."""
+    frontend = {
+        "level": "ERROR",
+        "app": "frontend",
+        "version": "v1.0.22",
+        "logger": "react-query.mutation",
+        "msg": "ApiError: Internal Server Error",
+        "exc": "ApiError: Internal Server Error\n    at r (index-abc.js:1:2)",
+        "data": {"status": 500, "url": "/requests"},
+    }
+    extension = {
+        "level": "WARNING",
+        "app": "book-portal-extension",
+        "version": "0.7.2",
+        "logger": "content",
+        "msg": "portal didn't confirm the shipment",
+        "data": {"refused": True, "package": None, "url": "/Shipment/Add"},
+    }
+    for body in (frontend, extension):
+        response = client.post("/client-errors", content=json.dumps(body), headers=JSON)
+        assert response.status_code == 204
+    found = events(log_dir)
+    assert found[0]["data"] == frontend["data"]
+    assert found[1]["data"] == extension["data"]
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -157,19 +186,199 @@ def test_host_without_x_real_ip_is_the_connection(client, log_dir):
 )
 def test_invalid_report_is_422(client, log_dir, body):
     """An app other than the browser ones, or a malformed event, is refused."""
-    assert client.post("/client-errors", json=body).status_code == 422
+    response = client.post("/client-errors", json=body)
+    assert response.status_code == 422
+    assert response.json()["detail"] == INVALID["detail"]
+    assert not events(log_dir)
+
+
+def test_422_names_fields_and_types_never_the_input(client, log_dir):
+    """The answer says which field and what kind of error, not what was sent
+    (nor a key the client chose)."""
+    body = report(logger="secret " * 50, level="LOUD", data={"secret key": [{}]})
+    response = client.post("/client-errors", json=body)
+    assert response.status_code == 422
+    assert response.json() == {
+        **INVALID,
+        "errors": [
+            {"field": "level", "type": "literal_error"},
+            {"field": "logger", "type": "string_too_long"},
+        ],
+    }
+    assert "secret" not in response.text
+    assert not events(log_dir)
+
+
+@pytest.mark.parametrize(
+    "body, errors",
+    [
+        # Out of range for a double: the parser makes it inf.
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": 1e400}',
+            [{"field": "msg", "type": "number_out_of_range"}],
+        ),
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "x", "data": {"n": -1e999}}',
+            [{"field": "data", "type": "number_out_of_range"}],
+        ),
+        # Anywhere, even in a field that would be ignored.
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "x", "ts": [1e400]}',
+            [{"field": "", "type": "number_out_of_range"}],
+        ),
+        # Beyond what a JSON reader keeps exact.
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "x", "data": {"n": 9007199254740992}}',
+            [{"field": "data", "type": "number_out_of_range"}],
+        ),
+        # Beyond what the parser takes at all.
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "x", "data": {"n": '
+            + b"9" * 5000
+            + b"}}",
+            [{"field": "", "type": "json_invalid"}],
+        ),
+        # Not JSON: the non-finite literals.
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "x", "data": {"n": NaN}}',
+            [{"field": "", "type": "json_invalid"}],
+        ),
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "x", "data": {"n": Infinity}}',
+            [{"field": "", "type": "json_invalid"}],
+        ),
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "x", "data": {"n": -Infinity}}',
+            [{"field": "", "type": "json_invalid"}],
+        ),
+        # Malformed UTF-8, and a lone surrogate (which UTF-8 can't write).
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "\xff\xfe secret"}',
+            [{"field": "", "type": "json_invalid"}],
+        ),
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "\\ud800 secret"}',
+            [{"field": "", "type": "json_invalid"}],
+        ),
+        # Nested past the parser's limit.
+        (
+            b'{"level": "ERROR", "app": "frontend", "msg": "x", "data": '
+            + b'{"a": ' * 300
+            + b"1"
+            + b"}" * 301,
+            [{"field": "", "type": "json_invalid"}],
+        ),
+        (
+            b'[{"level": "ERROR", "app": "frontend", "msg": "x"}]',
+            [{"field": "", "type": "model_type"}],
+        ),
+    ],
+    ids=[
+        "overflowing-float",
+        "overflowing-float-in-data",
+        "overflowing-float-in-ignored-field",
+        "unsafe-integer",
+        "huge-integer",
+        "nan",
+        "infinity",
+        "minus-infinity",
+        "malformed-utf8",
+        "lone-surrogate",
+        "deep-nesting",
+        "not-an-object",
+    ],
+)
+def test_strict_json_is_required(client, log_dir, body, errors):
+    """Each is a fixed 422 (never a 500, never the input echoed), and
+    nothing is written."""
+    response = client.post("/client-errors", content=body, headers=JSON)
+    assert response.status_code == 422
+    assert response.json() == {**INVALID, "errors": errors}
+    assert "secret" not in response.text
     assert not events(log_dir)
 
 
 def test_invalid_json_is_422(client, log_dir):
     """A body that isn't JSON is refused."""
-    response = client.post(
-        "/client-errors",
-        content=b"{not json",
-        headers={"Content-Type": "application/json"},
-    )
+    response = client.post("/client-errors", content=b"{not json", headers=JSON)
     assert response.status_code == 422
+    assert response.json() == {
+        **INVALID,
+        "errors": [{"field": "", "type": "json_invalid"}],
+    }
     assert not events(log_dir)
+
+
+def test_msg_and_exc_are_cut_short(client, log_dir):
+    """msg and exc are kept to their caps, ending in an ellipsis."""
+    msg = "m" * (client_errors.MAX_MSG_CHARS + 10)
+    exc = "e" * client_errors.MAX_EXC_CHARS
+    client.post("/client-errors", json=report(msg=msg, exc=exc + "tail"))
+    (event,) = events(log_dir)
+    assert event["msg"] == "m" * (client_errors.MAX_MSG_CHARS - 1) + "…"
+    assert event["exc"] == "e" * (client_errors.MAX_EXC_CHARS - 1) + "…"
+    client.post("/client-errors", json=report(msg="short", exc="e" * 100))
+    assert events(log_dir)[1]["msg"] == "short"
+    assert events(log_dir)[1]["exc"] == "e" * 100
+
+
+def test_data_is_bounded(client, log_dir):
+    """Scalars (and short lists of them) are kept, strings cut short, at
+    most MAX_DATA_KEYS keys; nested objects and overlong keys are left out."""
+    limit = client_errors.MAX_DATA_TEXT_CHARS
+    data = {
+        "status": 500,
+        "detail": "d" * (limit + 50),
+        "queued": True,
+        "package": None,
+        "ratio": 0.5,
+        "missing": ["isbn", "title"],
+        "nested": {"a": 1},
+        "mixed": ["ok", {"a": 1}],
+        "k" * (client_errors.MAX_DATA_KEY_CHARS + 1): 1,
+        "long list": list(range(30)),
+    }
+    data.update({f"extra{i}": i for i in range(30)})
+    client.post("/client-errors", json=report(data=data))
+    (event,) = events(log_dir)
+    kept = event["data"]
+    assert len(kept) == client_errors.MAX_DATA_KEYS
+    assert kept["status"] == 500
+    assert kept["detail"] == "d" * (limit - 1) + "…"
+    assert kept["queued"] is True and kept["package"] is None
+    assert kept["ratio"] == 0.5
+    assert kept["missing"] == ["isbn", "title"]
+    assert kept["long list"] == list(range(client_errors.MAX_DATA_LIST_ITEMS))
+    assert "nested" not in kept and "mixed" not in kept
+    assert not any(key.startswith("kkk") for key in kept)
+    assert list(kept)[-1] == "extra12"  # 7 kept above, then 13 more
+
+
+@pytest.mark.parametrize(
+    "data, expected",
+    [
+        ({"url": "/inmates/12345?q=SMITH#top"}, {"url": "/inmates/12345"}),
+        (
+            {"url": "http://ibp-server/requests?inmate=01234567"},
+            {"url": "http://ibp-server/requests"},
+        ),
+        (
+            {"source": "http://ibp-server/assets/index-abc.js?v=1#x:12:34"},
+            {"source": "http://ibp-server/assets/index-abc.js:12:34"},
+        ),
+        (
+            {"source": "http://ibp-server/a.js:5:6"},
+            {"source": "http://ibp-server/a.js:5:6"},
+        ),
+        ({"nested": {"a": 1}}, None),
+    ],
+)
+def test_data_urls_lose_query_and_fragment(client, log_dir, data, expected):
+    """data.url and data.source are kept without the query string or
+    fragment; data left empty is left out."""
+    client.post("/client-errors", json=report(data=data))
+    (event,) = events(log_dir)
+    assert event.get("data") == expected
 
 
 def test_over_16_kib_is_413(client, log_dir):

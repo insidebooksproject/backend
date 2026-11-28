@@ -117,8 +117,13 @@ values (`hide_parameters`), as both can hold inmate data:
   `POST /client-errors` (`ibp/client_errors.py`). The body is one event
   without `ts` and `host`, which the backend adds (`host` is the client
   address from nginx's `X-Real-IP`); `level`, `app` and `msg` are required
-  and `app` is `frontend` or `book-portal-extension`, else it is a 422. A
-  body over 16 KiB is a 413. Each address may send 30 a minute; the rest
+  and `app` is `frontend` or `book-portal-extension`, and it must be strict
+  JSON (no NaN or Infinity, no number out of range, valid UTF-8), else it
+  is a 422 whose body names only the fields and error types, never what
+  was sent. `msg` and `exc` are cut to 1024 and 8192 characters; `data`
+  keeps at most 20 keys with scalar values (or short lists of them),
+  strings cut to 500 characters, and `data.url` and `data.source` without
+  a query string or fragment. A body over 16 KiB is a 413. Each address may send 30 a minute; the rest
   are dropped with a 429, and one WARNING per address and minute says how
   many. A report that is taken is a 204; one that can't be written (a
   full disk, a failed rotation) is a 503, and the first of a run of such

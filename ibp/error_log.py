@@ -114,7 +114,10 @@ class EventFormatter(logging.Formatter):
     """Writes a record's ``event`` dict as it is (the client reports)."""
 
     def format(self, record: logging.LogRecord) -> str:
-        return json.dumps(getattr(record, "event"), default=repr, ensure_ascii=False)
+        # Strict JSON: a NaN or Infinity is an error, not a nonstandard line.
+        return json.dumps(
+            getattr(record, "event"), default=repr, ensure_ascii=False, allow_nan=False
+        )
 
 
 class PrivateRotatingFileHandler(RotatingFileHandler):

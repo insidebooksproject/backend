@@ -5,8 +5,15 @@ each error here as one event of the shared format without ``ts`` and
 ``host``; the backend adds both and appends the event to
 ``client-errors.jsonl`` (``ibp/error_log.py``).
 
-- The body is at most 16 KiB (larger is a 413) and must be a valid event
-  (else a 422); ``app`` is ``frontend`` or ``book-portal-extension``.
+- The body is at most 16 KiB (larger is a 413) and must be strict JSON
+  (no NaN or Infinity, no number out of range) and a valid event (else a
+  422 naming only the fields and error types, never what was sent);
+  ``app`` is ``frontend`` or ``book-portal-extension``.
+- What is kept is bounded: ``msg`` and ``exc`` are cut to
+  ``MAX_MSG_CHARS`` and ``MAX_EXC_CHARS``; ``data`` keeps at most
+  ``MAX_DATA_KEYS`` keys with scalar values (or short lists of them),
+  strings cut to ``MAX_DATA_TEXT_CHARS``, and ``data.url`` and
+  ``data.source`` lose any query string or fragment.
 - ``host`` is the client address nginx passes in ``X-Real-IP`` (the
   connection's address without it).
 - At most 30 reports a minute are taken from one address. Over that they
@@ -20,14 +27,17 @@ import asyncio
 import ipaddress
 import json
 import logging
+import math
+import re
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from fastapi import Request, Response, status
-from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic_core import from_json
 from starlette.concurrency import run_in_threadpool
 
 from .base import app
@@ -39,7 +49,70 @@ MAX_BODY_BYTES = 16 * 1024
 RATE_LIMIT = 30
 RATE_WINDOW_S = 60.0
 
+MAX_MSG_CHARS = 1024
+MAX_EXC_CHARS = 8192
+MAX_DATA_KEYS = 20
+MAX_DATA_KEY_CHARS = 64
+MAX_DATA_TEXT_CHARS = 500
+MAX_DATA_LIST_ITEMS = 20
+# Integers beyond this are refused like non-finite floats: no JSON reader
+# keeps them exact.
+MAX_SAFE_INTEGER = 2**53 - 1
+# data keys that hold a URL (or ``url:line:col``), kept without the query
+# string or fragment, which can hold inmate numbers.
+URL_KEYS = frozenset({"url", "source"})
+
 Level = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+Scalar = str | int | float | bool | None
+
+
+def truncate(text: str, limit: int) -> str:
+    """``text`` cut to ``limit`` characters, the last one an ellipsis."""
+    return text if len(text) <= limit else f"{text[: limit - 1]}…"
+
+
+def strip_query(value: str) -> str:
+    """A URL (or ``url:line:col``) without its query string or fragment."""
+    match = re.fullmatch(r"(.*?)((?::\d+){1,2})?", value, flags=re.DOTALL)
+    url, position = (match.group(1), match.group(2) or "") if match else (value, "")
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit(parts._replace(query="", fragment="")) + position
+
+
+def clean_scalar(value: Any) -> tuple[bool, Scalar]:
+    """``(True, value)`` for a scalar (a string cut short), else ``(False,
+    None)``."""
+    if isinstance(value, str):
+        return True, truncate(value, MAX_DATA_TEXT_CHARS)
+    if value is None or isinstance(value, (bool, int, float)):
+        return True, value
+    return False, None
+
+
+def clean_data(data: dict[str, Any]) -> dict[str, Any] | None:
+    """``data`` bounded: at most ``MAX_DATA_KEYS`` keys of at most
+    ``MAX_DATA_KEY_CHARS`` characters, each value a scalar or a list of at
+    most ``MAX_DATA_LIST_ITEMS`` scalars (anything else is left out), and
+    the URL keys without their query string or fragment."""
+    cleaned: dict[str, Any] = {}
+    for key, value in data.items():
+        if len(cleaned) >= MAX_DATA_KEYS:
+            break
+        if len(key) > MAX_DATA_KEY_CHARS:
+            continue
+        if isinstance(value, list):
+            items = [clean_scalar(item) for item in value[:MAX_DATA_LIST_ITEMS]]
+            if not all(ok for ok, _ in items):
+                continue
+            cleaned[key] = [item for _, item in items]
+            continue
+        ok, scalar = clean_scalar(value)
+        if not ok:
+            continue
+        if key in URL_KEYS and isinstance(scalar, str):
+            scalar = strip_query(scalar)
+        cleaned[key] = scalar
+    return cleaned or None
 
 
 class ClientErrorReport(BaseModel):
@@ -59,6 +132,87 @@ class ClientErrorReport(BaseModel):
     @classmethod
     def _upper_level(cls, value: Any) -> Any:
         return value.upper() if isinstance(value, str) else value
+
+    @field_validator("msg")
+    @classmethod
+    def _cut_msg(cls, value: str) -> str:
+        return truncate(value, MAX_MSG_CHARS)
+
+    @field_validator("exc")
+    @classmethod
+    def _cut_exc(cls, value: str | None) -> str | None:
+        return None if value is None else truncate(value, MAX_EXC_CHARS)
+
+    @field_validator("data")
+    @classmethod
+    def _bound_data(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return None if value is None else clean_data(value)
+
+
+FIELDS = frozenset(ClientErrorReport.model_fields)
+
+
+class InvalidReport(Exception):
+    """A report that is refused with a 422; ``errors`` are safe to return."""
+
+    def __init__(self, errors: list[dict[str, str]]) -> None:
+        super().__init__("invalid report")
+        self.errors = errors
+
+
+def safe_errors(error: ValidationError) -> list[dict[str, str]]:
+    """The field (a top-level one, never a key the client chose) and error
+    type of each validation error, without the input or its message."""
+    found = []
+    for item in error.errors(include_url=False, include_input=False):
+        known = [part for part in item["loc"] if part in FIELDS]
+        entry = {"field": str(known[0]) if known else "", "type": item["type"]}
+        if entry not in found:
+            found.append(entry)
+    return found
+
+
+def out_of_range(value: Any) -> bool:
+    """Whether ``value`` holds, anywhere, a non-finite float or an integer
+    beyond ``MAX_SAFE_INTEGER``."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, int):
+        return abs(value) > MAX_SAFE_INTEGER
+    if isinstance(value, dict):
+        return any(out_of_range(item) for item in value.values())
+    if isinstance(value, list):
+        return any(out_of_range(item) for item in value)
+    return False
+
+
+def parse_report(body: bytes) -> ClientErrorReport:
+    """The report in ``body``; raises :class:`InvalidReport`.
+
+    Strict JSON: malformed UTF-8, a lone surrogate, NaN or Infinity, nesting
+    deeper than the parser's limit, and (anywhere, ignored fields too) a
+    number that is out of range are all refused.
+    """
+    try:
+        parsed = from_json(body, allow_inf_nan=False)
+    except ValueError as error:
+        raise InvalidReport([{"field": "", "type": "json_invalid"}]) from error
+    if not isinstance(parsed, dict):
+        raise InvalidReport([{"field": "", "type": "model_type"}])
+    bad = [key for key, value in parsed.items() if out_of_range(value)]
+    if bad:
+        raise InvalidReport(
+            [
+                {"field": key if key in FIELDS else "", "type": "number_out_of_range"}
+                for key in dict.fromkeys(bad)
+            ]
+        )
+    try:
+        return ClientErrorReport.model_validate(parsed)
+    except ValidationError as error:
+        raise InvalidReport(safe_errors(error)) from error
 
 
 @dataclass
@@ -160,6 +314,15 @@ async def read_body(request: Request) -> bytes | None:
     return bytes(body)
 
 
+def json_response(status_code: int, content: dict[str, Any]) -> Response:
+    """A JSON answer with a body the server chose."""
+    return Response(
+        content=json.dumps(content),
+        media_type="application/json",
+        status_code=status_code,
+    )
+
+
 @app.post(
     "/client-errors",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -182,15 +345,16 @@ async def report_client_error(request: Request) -> Response:
 
     body = await read_body(request)
     if body is None:
-        return Response(
-            content=json.dumps({"detail": "Report larger than 16 KiB."}),
-            media_type="application/json",
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        return json_response(
+            status.HTTP_413_CONTENT_TOO_LARGE, {"detail": "Report larger than 16 KiB."}
         )
     try:
-        report = ClientErrorReport.model_validate_json(body)
-    except ValidationError as error:
-        raise RequestValidationError(error.errors(include_url=False)) from error
+        report = parse_report(body)
+    except InvalidReport as error:
+        return json_response(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            {"detail": "Invalid report.", "errors": error.errors},
+        )
 
     event: dict[str, Any] = {
         "ts": timestamp(received),
@@ -208,9 +372,7 @@ async def report_client_error(request: Request) -> Response:
             client_error_log.write, {k: v for k, v in event.items() if v is not None}
         )
     except WriteFailed:
-        return Response(
-            content=json.dumps({"detail": "Report not recorded."}),
-            media_type="application/json",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        return json_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE, {"detail": "Report not recorded."}
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
