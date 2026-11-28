@@ -419,8 +419,11 @@ the sync's run lock throughout, so no sync can migrate the restored
 database, and it stops the backup timer and waits for a backup in progress,
 so none has the database open while it is swapped; it checks everything
 that can fail before moving any file, and it can be run again after a
-failure. It leaves the shipment timer stopped, and starts the backup timer
-again at the end if it was running:
+failure. Once the old version is up and answering `/api/health`, it
+starts the backup timer again if it was running. It leaves the shipment
+timer stopped, and ends with the commands that put it back as it was
+before the upgrade (enabled, running, or neither: the upgrade disables it),
+to run once the old wrapper is in place:
 
     (
       set -Eeuo pipefail
@@ -438,6 +441,19 @@ again at the end if it was running:
       if [ ! -e "$backup_was" ]; then
         timer_state=$(systemctl show -p ActiveState --value ibp-backup.timer)
         printf '%s\n' "$timer_state" > "$backup_was"
+      fi
+      # The shipment timer's state to put back once the old version is
+      # healthy, kept once: as the upgrade recorded it before disabling it
+      # (if the upgrade stopped before putting it back), else as it is now.
+      sync_was=.shipment-timer-before-rollback
+      if [ ! -e "$sync_was" ]; then
+        if [ -s .shipment-timer-before-<new tag> ]; then
+          cp -p .shipment-timer-before-<new tag> "$sync_was"
+        else
+          enabled=$(systemctl show -p UnitFileState --value ibp-shipment-sync.timer)
+          active=$(systemctl show -p ActiveState --value ibp-shipment-sync.timer)
+          printf '%s %s\n' "$enabled" "$active" > "$sync_was"
+        fi
       fi
       sudo systemctl stop ibp-shipment-sync.timer ibp-backup.timer
       # Wait for a sync or a backup already running: the services (a running
@@ -497,10 +513,15 @@ again at the end if it was running:
       mv data/data.db.restoring data/data.db
       mv .env.restoring .env
       rm -f "$marker"
-      docker compose up -d
-      docker compose ps                         # both on the old tag, healthy
+      docker compose up -d --wait               # both on the old tag, healthy
+      curl -fsS -o /dev/null http://localhost/api/health
       read -r timer_state < "$backup_was"
       if [ "$timer_state" = active ]; then sudo systemctl start ibp-backup.timer; fi
       rm -f "$backup_was"
-      echo "ROLLED BACK to $previous_tag; the database it replaced is in /srv/ibp/$aside. The shipment timer is still stopped: start it (sudo systemctl start ibp-shipment-sync.timer) only once the old version is confirmed healthy, and first reinstall the old wrapper and units from a checkout of $previous_tag if the rollback crosses the release that changed them."
+      read -r was_enabled was_active < "$sync_was"
+      resume=""
+      if [ "$was_enabled" = enabled ]; then resume="sudo systemctl enable ibp-shipment-sync.timer"; fi
+      if [ "$was_active" = active ]; then resume="${resume:+$resume && }sudo systemctl start ibp-shipment-sync.timer"; fi
+      resume=${resume:-nothing: it was disabled and stopped before the upgrade}
+      echo "ROLLED BACK to $previous_tag, healthy; the database it replaced is in /srv/ibp/$aside. The shipment timer is still stopped: first reinstall the old wrapper and units from a checkout of $previous_tag if the rollback crosses the release that changed them, then put the timer back as it was before the upgrade ($resume; the state is in /srv/ibp/$sync_was, which you can delete then)."
     )

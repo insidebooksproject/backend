@@ -334,8 +334,8 @@ def test_rollback_checks_everything_before_moving_anything(tmp_path):
     after = [step for step in steps[first_move:] if not step.startswith("mv ")]
     assert after == [
         "rm -f data/.rollback-in-progress",
-        "docker compose up -d",
-        "docker compose ps",
+        "docker compose up -d --wait",
+        "curl -fsS -o /dev/null http://localhost/api/health",
         "rm -f .backup-timer-before-rollback",
     ]
     srv = root / "srv" / "ibp"
@@ -353,7 +353,7 @@ def test_rollback_run_again_keeps_the_first_kept_database(tmp_path):
     root = sandbox(tmp_path)
     steps = run_block(root, rollback_block()).steps
     root = sandbox(tmp_path / "retry")
-    up = steps.index("docker compose up -d") + 1
+    up = steps.index("docker compose up -d --wait") + 1
     assert run_block(root, rollback_block(), up).status != 0
     (first,) = (root / "srv" / "ibp" / "data").glob("before-rollback-*")
     assert run_block(root, rollback_block()).status == 0
@@ -426,6 +426,50 @@ def test_rollback_leaves_the_timer_stopped_and_says_when_to_start_it(tmp_path):
     ]
     assert "The shipment timer is still stopped" in result.output
     assert "reinstall the old wrapper and units" in result.output
+
+
+@pytest.mark.parametrize(
+    "recorded, env, resume",
+    [
+        # The upgrade stopped with the timer disabled: its record counts.
+        (
+            "enabled active\n",
+            {"TIMER_ENABLED": "disabled", "TIMER_STATE": "inactive"},
+            "sudo systemctl enable ibp-shipment-sync.timer && "
+            "sudo systemctl start ibp-shipment-sync.timer",
+        ),
+        ("enabled inactive\n", {}, "sudo systemctl enable ibp-shipment-sync.timer"),
+        # A finished upgrade left no record: the timer as it is now.
+        (
+            None,
+            {"TIMER_ENABLED": "enabled", "TIMER_STATE": "active"},
+            "sudo systemctl enable ibp-shipment-sync.timer && "
+            "sudo systemctl start ibp-shipment-sync.timer",
+        ),
+        (
+            None,
+            {"TIMER_ENABLED": "disabled", "TIMER_STATE": "inactive"},
+            "nothing: it was disabled and stopped before the upgrade",
+        ),
+    ],
+)
+def test_rollback_says_how_to_put_the_timer_back_once_healthy(
+    tmp_path, recorded, env, resume
+):
+    """After the old version answers /api/health, the rollback ends with
+    the commands that put the timer back as it was before the upgrade."""
+    root = sandbox(tmp_path)
+    if recorded is not None:
+        (root / "srv" / "ibp" / ".shipment-timer-before-X").write_text(recorded)
+    result = run_block(root, rollback_block(), env=env)
+    assert result.status == 0, result.output
+    assert result.steps.index("docker compose up -d --wait") < result.steps.index(
+        "curl -fsS -o /dev/null http://localhost/api/health"
+    )
+    assert (
+        f"put the timer back as it was before the upgrade ({resume};" in result.output
+    )
+    assert not [s for s in result.steps if s.startswith(("systemctl enable", START))]
 
 
 @pytest.mark.parametrize("missing", ["file", "tag"])
