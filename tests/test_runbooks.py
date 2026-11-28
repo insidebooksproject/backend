@@ -697,6 +697,62 @@ def test_upgrade_run_again_after_the_switch_only_finishes(tmp_path):
     assert (root / MARKER).read_text() == marker
 
 
+@pytest.mark.parametrize(
+    "live",
+    [
+        'IBP_TAG="X"\n',
+        "IBP_TAG=X  # the new release\n",
+        "export IBP_TAG=X\n",
+        "IBP_TAG=v1.0.0\nIBP_TAG='X'\n",
+    ],
+)
+def test_upgrade_reads_the_live_tag_as_compose_does(tmp_path, live):
+    """However .env writes the new tag after the switch, a re-run sees the
+    switch and only finishes: no new backup, the marker kept."""
+    clean = upgrade_steps(tmp_path)
+    root = fresh_upgrade(tmp_path, "retry")
+    run_block(root, upgrade_block(), clean.index("docker compose pull") + 1)
+    (root / UPGRADE_ENV).write_text(live)
+    marker = (root / MARKER).read_text()
+    again = run_block(root, upgrade_block())
+    assert again.status == 0, again.output
+    assert "Finishing: .env already names X" in again.output
+    assert "systemctl start ibp-backup.service" not in again.steps
+    assert (root / MARKER).read_text() == marker
+
+
+@pytest.mark.parametrize("broken", ["no marker", "no file", "empty file"])
+def test_finishing_needs_the_pinned_backup(tmp_path, broken):
+    """.env naming the new tag without a pinned backup from before the
+    switch stops the block before anything runs."""
+    clean = upgrade_steps(tmp_path)
+    root = fresh_upgrade(tmp_path, "retry")
+    run_block(root, upgrade_block(), clean.index("docker compose pull") + 1)
+    pinned = Path((root / MARKER).read_text().strip())
+    if broken == "no marker":
+        (root / MARKER).unlink()
+    elif broken == "no file":
+        pinned.unlink()
+    else:
+        pinned.write_text("")
+    again = run_block(root, upgrade_block())
+    assert again.status != 0
+    assert "NOT UPGRADED: .env already names X, but" in again.output
+    assert "nothing has changed" in again.output
+    assert not [s for s in again.steps if s.startswith(("docker", "systemctl", "curl"))]
+
+
+def test_finishing_refuses_another_exported_tag(tmp_path):
+    """The exported-IBP_TAG check applies when finishing too."""
+    clean = upgrade_steps(tmp_path)
+    root = fresh_upgrade(tmp_path, "retry")
+    run_block(root, upgrade_block(), clean.index("docker compose pull") + 1)
+    again = run_block(root, upgrade_block(), env={"IBP_TAG": "v9.9.9"})
+    assert again.status != 0
+    assert "IBP_TAG is exported as 'v9.9.9'" in again.output
+    assert not [s for s in again.steps if s.startswith("docker")]
+
+
 def test_upgrade_run_again_before_the_switch_pins_its_own_backup(tmp_path):
     """Each attempt that gets to the backup pins its own and names it."""
     clean = upgrade_steps(tmp_path)

@@ -195,51 +195,60 @@ and the timer's first recorded state.
       left="nothing has changed: the shipment timer, .env and the log owner are as they were"
       trap 'echo "UPGRADE STOPPED: $left. Fix the failed step and run this block again." >&2' ERR
       cd /srv/ibp
+      # A value as compose reads it: without quotes or spaces; and a
+      # setting of an .env file (setting FILE NAME): its last one, with or
+      # without "export", without a trailing comment. Every tag and id
+      # below is read with these.
+      clean() { printf '%s' "$1" | tr -d "\"' \t\r"; }
+      setting() {
+        local value
+        value=$(sed -n "s/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$2[[:space:]]*=//p" "$1" | tail -n 1)
+        clean "${value%%[[:space:]]#*}"
+      }
       # Save the previous .env once: a re-run after .env was edited must
       # not replace the saved copy with the new tag.
       saved=.env.pre-<new tag>
       if [ ! -e "$saved" ]; then cp -p .env "$saved"; fi
-      saved_tag=$(sed -n 's/^IBP_TAG=//p' "$saved")
+      saved_tag=$(setting "$saved" IBP_TAG)
       if [ -z "$saved_tag" ] || [ "$saved_tag" = "<new tag>" ]; then
         echo "NOT UPGRADED: $saved names ${saved_tag:-no IBP_TAG}, not the version to roll back to; fix it by hand first"
         exit 1
       fi
       next=.env.next-<new tag>
       timer_was=.shipment-timer-before-<new tag>
-      live_tag=$(sed -n 's/^IBP_TAG=//p' .env | tail -n 1)
-      if [ "$live_tag" = "<new tag>" ] && [ ! -e "$next" ]; then
-        # The swap was made by an earlier run: only finish.
-        echo "Finishing: .env already names <new tag>"
-        left=".env names <new tag> and the shipment timer is disabled; run this block again to finish, or roll back with the backup in .backup-before-<new tag>; don't start the timer before the new version is healthy"
+      marker=.backup-before-<new tag>
+      # Compose takes an exported IBP_TAG over .env's.
+      if exported_tag=$(printenv IBP_TAG) && [ "$(clean "$exported_tag")" != "<new tag>" ]; then
+        echo "NOT UPGRADED: IBP_TAG is exported as '$exported_tag', which compose would deploy instead of <new tag>; unset it and run this block again; nothing has changed"
+        exit 1
+      fi
+      live_tag=$(setting .env IBP_TAG)
+      if [ "$live_tag" = "<new tag>" ]; then
+        # The swap was made by an earlier run: only finish, and only with
+        # the backup it pinned before the swap.
+        pinned=""
+        if [ -s "$marker" ]; then read -r pinned < "$marker"; fi
+        if [ -z "$pinned" ] || [ ! -s "$pinned" ]; then
+          echo "NOT UPGRADED: .env already names <new tag>, but $marker names no pinned backup that exists and isn't empty, so this isn't an upgrade this block switched; nothing has changed; find out how .env came to name <new tag> before going on"
+          exit 1
+        fi
+        echo "Finishing: .env already names <new tag>; the backup from before the switch is $pinned"
+        left=".env names <new tag> and the shipment timer is disabled; run this block again to finish, or roll back with the backup in $marker; don't start the timer before the new version is healthy"
       else
         # The new .env is edited as a copy, kept if this block is run again:
         # .env itself changes only once a backup exists and no sync can start.
         if [ ! -e "$next" ]; then cp -p .env "$next"; fi
         "${EDITOR:-nano}" "$next"                # new IBP_TAG
-        # A setting of the copy as compose reads it: the last one, without
-        # quotes, spaces or a trailing comment.
-        setting() {
-          local value
-          value=$(sed -n "s/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$1[[:space:]]*=//p" "$next" | tail -n 1)
-          value=${value%%[[:space:]]#*}
-          printf '%s' "$value" | tr -d "\"' \t\r"
-        }
-        next_tag=$(setting IBP_TAG)
+        next_tag=$(setting "$next" IBP_TAG)
         if [ "$next_tag" != "<new tag>" ]; then
           echo "NOT UPGRADED: $next names IBP_TAG '${next_tag}', not <new tag>; fix it and run this block again; nothing has changed"
-          exit 1
-        fi
-        # Compose takes an exported IBP_TAG over .env's.
-        if exported_tag=$(printenv IBP_TAG) && [ "$exported_tag" != "<new tag>" ]; then
-          echo "NOT UPGRADED: IBP_TAG is exported as '$exported_tag', which compose would deploy instead of <new tag>; unset it and run this block again; nothing has changed"
           exit 1
         fi
         # The container's user, as compose will run it: IBP_UID/IBP_GID as
         # exported (what docker compose sees), else the copy's, else 1000.
         owner_id() {
           local value
-          if value=$(printenv "$1"); then :; else value=$(setting "$1"); fi
-          value=$(printf '%s' "$value" | tr -d "\"' \t\r")
+          if value=$(printenv "$1"); then value=$(clean "$value"); else value=$(setting "$next" "$1"); fi
           case "$value" in
             '') value=1000 ;;
             *[!0-9]*)
@@ -267,7 +276,7 @@ and the timer's first recorded state.
       if [ "$was_enabled" = enabled ]; then resume="sudo systemctl enable ibp-shipment-sync.timer"; fi
       if [ "$was_active" = active ]; then resume="${resume:+$resume && }sudo systemctl start ibp-shipment-sync.timer"; fi
       resume=${resume:-nothing (it was disabled and stopped before, or is back already)}
-      if [ "$live_tag" != "<new tag>" ] || [ -e "$next" ]; then
+      if [ "$live_tag" != "<new tag>" ]; then
         left="the shipment timer may be disabled; .env (still $live_tag) and the log owner are unchanged, so the current version still runs; to stay on it, resume the timer: $resume"
         sudo systemctl disable --now ibp-shipment-sync.timer
         left="the shipment timer is disabled; .env (still $live_tag) and the log owner are unchanged, so the current version still runs; to stay on it, resume the timer: $resume"
@@ -288,7 +297,7 @@ and the timer's first recorded state.
       mkdir -p ~/.local/state/ibp-shipment-sync
       exec 9>>~/.local/state/ibp-shipment-sync/run.lock
       flock -n 9 || { echo "NOT UPGRADED: a shipment sync holds its run lock; wait for it to finish and run this block again; $left"; exit 1; }
-      if [ "$live_tag" != "<new tag>" ] || [ -e "$next" ]; then
+      if [ "$live_tag" != "<new tag>" ]; then
         # A fresh backup of the database as the current version left it; the
         # service fails if the backup does (an integrity check included). It
         # is pinned outside ibp-backup's rotation for a rollback.
@@ -297,8 +306,14 @@ and the timer's first recorded state.
         mkdir -p ~/backups/ibp-pinned
         pinned=~/backups/ibp-pinned/before-<new tag>-$(date +%Y-%m-%d_%H%M%S).db.zst
         cp -p "$backup" "$pinned"
-        printf '%s\n' "$pinned" > .backup-before-<new tag>
-        echo "Backup for a rollback: $pinned (named in /srv/ibp/.backup-before-<new tag>)"
+        # Named only while .env still names the running version: once the
+        # switch is made, the marker keeps the backup from before it.
+        if [ "$(setting .env IBP_TAG)" = "<new tag>" ]; then
+          echo "NOT UPGRADED: .env changed to <new tag> during this run; $marker is left as it was and the shipment timer disabled; check .env by hand"
+          exit 1
+        fi
+        printf '%s\n' "$pinned" > "$marker"
+        echo "Backup for a rollback: $pinned (named in /srv/ibp/$marker)"
         # The error logs: the new container's user owns the directory, closed
         # to other users, and its files, 0640 (no change if the owner is the
         # same). Then the new .env takes effect.
