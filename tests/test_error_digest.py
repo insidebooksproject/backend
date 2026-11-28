@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1782,3 +1783,54 @@ def test_failed_units_now_are_shown_at_the_time_they_were_seen(tree):
     assert group["message"] == "unit failed: ibp-label-refund.service"
     assert group["last_seen"] == digest.iso(late)
     assert report["window"]["until"] == digest.iso(NOW)
+
+
+# The intake's tests (backend tests/test_scrub.py), on the digest's copy of
+# the patterns: both sides must behave the same.
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ('password: "correct horse battery" ok', "password: <secret> ok"),
+        ("password='correct horse battery'", "password=<secret>"),
+        ('{"password": "correct horse", "n": 1}', '{"password": <secret>, "n": 1}'),
+        ("api_key=abc&x=1", "api_key=<secret>&x=1"),
+        ("X-Api-Key: abc123", "X-Api-Key: <secret>"),
+        ("Authorization: Bearer abcdefgh12345678", "Authorization: Bearer <secret>"),
+        ("Basic dXNlcjpwYXNzd29yZA==", "Basic <secret>"),
+        ("https://user:pw@host/x", "https://<secret>@host/x"),
+        ("eyJhbGciOi.eyJzdWIi.c2ln", "<secret>"),
+        ("sk-ant-api03-AbCdEf1234567890AbCdEf1234567890", "<secret>"),
+    ],
+)
+def test_scrub_matches_the_intake(text, expected):
+    assert digest.scrub(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SMITH, JOHN 01234567 TEX-00012345-0 at 2001 Main St, Huntsville",
+        "at r (http://ibp-server/assets/index-DkS8f3jK.js:1:2345)",
+        'File "/app/.venv/lib/python3.13/site-packages/starlette/routing.py", '
+        "line 12",
+        "KeyError: 'name'",
+        "ISBN 9780140449136 not found",
+        "shippy/gui/workers/shipment_worker.py:41 run",
+        "ibp-kiosk-launcher: ERROR tile portal failed for inmate Jane Q Example",
+    ],
+)
+def test_scrub_keeps_inmate_details_paths_and_frames(text):
+    assert digest.scrub(text) == text
+    assert digest.redact(text) == " ".join(text.split())
+
+
+@pytest.mark.parametrize(
+    "text", ["a-" * 8000, "k_" * 8000, "a" * 16000, "1a" * 8000, "Aa1-" * 4000]
+)
+def test_scrub_of_a_long_run_is_cheap(text):
+    start = time.perf_counter()
+    digest.scrub(text)
+    digest.redact(text, limit=len(text))
+    assert time.perf_counter() - start < 0.5

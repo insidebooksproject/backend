@@ -115,7 +115,9 @@ no raw path.
 plain-name `operation`),
 request body or raw line is ever copied. In each message and exception
 line: secrets become `<secret>` (a URL's `user:password@`, `Bearer`/`Basic`
-credentials, the value of `key=`, `token=`, `password:` and the like, JWTs,
+credentials, the value of `key=`, `token=`, `password:` and the like (a
+quoted value whole, and a JSON-quoted key too; the same pattern as the
+intake's `ibp/scrub.py`), JWTs,
 runs of 24 or more of `A-Z a-z 0-9 _ + = -` with two capitals, two small
 letters and two digits, and runs of 32 or more mixed hex digits); and
 e-mail addresses become `<email>`. The same secret patterns then run over

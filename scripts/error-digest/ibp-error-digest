@@ -177,13 +177,22 @@ DIGITS = re.compile(r"\d{4,}")
 # run of characters (TOKEN).
 USERINFO = re.compile(r"(?<=://)[^\s/@]+@")
 AUTH_SCHEME = re.compile(r"\b(?P<scheme>Bearer|Basic|Token)\s+[\w.~+/=-]{8,}", re.I)
+# As backend ibp/scrub.py (the intake's): the key may be quoted (JSON:
+# ``"password": "..."``); the value is a quoted string, whole, or a run up
+# to a separator. The key is tried only at the start of a word (not at each
+# ``-`` inside one, as ``\b`` would), so a long ``a-a-a-...`` run costs one
+# try, not one per dash.
 SECRET_PAIR = re.compile(
-    r"(?P<key>\b[\w-]*(?:key|token|secret|password|passwd|pwd|signature|sig"
+    r"(?P<key>(?<![\w-])[\w-]*(?:key|token|secret|password|passwd|pwd|signature|sig"
     r"|auth|authorization|session|cookie|credentials?)s?)"
-    r"(?P<sep>\s*[=:]\s*)(?!(?:Bearer|Basic|Token)\s)(?P<value>[^\s&\"',;<>]+)",
+    r"(?P<sep>[\"']?\s*[=:]\s*)(?!(?:Bearer|Basic|Token)\s)"
+    r"(?P<value>\"[^\"]*\"?|'[^']*'?|[^\s&\"',;<>]+)",
     re.I,
 )
 JWT = re.compile(r"\beyJ[\w-]+\.[\w-]+(?:\.[\w-]+)?", re.A)
+# Stricter than ibp/scrub.py's TOKEN (one digit and one letter), since the
+# digest scrubs every field, frame and logger names too, where a long
+# snake_case name with a digit is common.
 # A token: 24 or more of [A-Za-z0-9_+=-] with at least two capitals, two
 # small letters and two digits (an API key, not a path or a snake_case name;
 # "/" splits a run, so a path is never one token), or 32 or more hex digits
