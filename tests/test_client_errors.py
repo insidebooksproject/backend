@@ -732,3 +732,14 @@ def test_secrets_are_scrubbed_before_writing(client, log_dir):
     text = (log_dir / CLIENT_LOG_NAME).read_text()
     for secret in ("AIzaSy", "abc.DEF", "horse", "hunter2", "sk-FAKE"):
         assert secret not in text
+
+
+def test_a_frame_after_a_credential_word_is_kept(client, log_dir):
+    """A message ending in "cookie:" doesn't eat the next line's frame."""
+    exc = (
+        "TypeError: missing cookie:\n"
+        "    at renderRows (http://ibp-server/assets/index-DkS8f3jK.js:10:5)"
+    )
+    assert client.post("/client-errors", json=report(exc=exc)).status_code == 204
+    (event,) = events(log_dir)
+    assert event["exc"] == exc

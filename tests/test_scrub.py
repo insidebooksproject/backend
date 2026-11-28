@@ -43,9 +43,56 @@ def test_inmate_details_and_frames_are_kept(text):
     assert scrub_secrets(text) == text
 
 
-@pytest.mark.parametrize("text", ["a-" * 8000, "k_" * 8000, "a" * 16000, "1a" * 8000])
+@pytest.mark.parametrize(
+    "text",
+    ["a-" * 8000, "k_" * 8000, "a" * 16000, "1a" * 8000, "token=" + "a:1" * 5000],
+)
 def test_a_long_run_is_cheap(text):
     """A 16 KiB body can't make the patterns backtrack for seconds."""
     start = time.perf_counter()
     scrub_secrets(text)
     assert time.perf_counter() - start < 0.5
+
+
+def test_a_quoted_value_with_escaped_quotes_is_replaced_whole():
+    """Escaped quotes inside a quoted value don't end it early."""
+    assert scrub_secrets('password: "a\\"b c" then') == "password: <secret> then"
+    assert scrub_secrets(r"secret='it\'s mine' x") == "secret=<secret> x"
+    assert (
+        scrub_secrets('{"token": "x\\\\" , "n": 1}') == '{"token": <secret> , "n": 1}'
+    )
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # The separator doesn't cross a line: the next frame keeps its "at".
+        (
+            "TypeError: missing cookie:\n"
+            "    at renderRows (http://ibp-server/assets/index-DkS8f3jK.js:10:5)",
+            "TypeError: missing cookie:\n"
+            "    at renderRows (http://ibp-server/assets/index-DkS8f3jK.js:10:5)",
+        ),
+        (
+            "missing password=\n    at f (a.js:1:2)",
+            "missing password=\n    at f (a.js:1:2)",
+        ),
+        # A frame's :line:col and closing parenthesis are kept.
+        (
+            "    at r (http://ibp-server/a.js?token=abc123:12:34)",
+            "    at r (http://ibp-server/a.js?token=<secret>:12:34)",
+        ),
+        (
+            "fetchToken@http://ibp-server/a.js?api_key=zz:3:4",
+            "fetchToken@http://ibp-server/a.js?api_key=<secret>:3:4",
+        ),
+        # An unclosed quote ends with its line.
+        (
+            'password: "abc\n    at f (a.js:1:2)',
+            "password: <secret>\n    at f (a.js:1:2)",
+        ),
+    ],
+)
+def test_stack_frames_survive(text, expected):
+    """Frames' "at", file:line:col suffixes and URL paths are kept."""
+    assert scrub_secrets(text) == expected
