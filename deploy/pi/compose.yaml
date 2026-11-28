@@ -19,6 +19,9 @@ x-logging: &logging
     max-file: "3"
 
 services:
+  # Only these two services share the stack's network, and the backend's
+  # port 8000 isn't published: the backend trusts X-Real-IP from Docker's
+  # 172.16.0.0/12 for that reason ([server] trusted_proxies).
   ibp-backend:
     image: ghcr.io/insidebooksproject/backend:${IBP_TAG:?set IBP_TAG in .env}
     environment:

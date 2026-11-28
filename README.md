@@ -129,7 +129,9 @@ values (`hide_parameters`), as both can hold inmate data:
   string or fragment. `host` is the client address from nginx's
   `X-Real-IP` when the connection comes from a trusted proxy
   (`[server] trusted_proxies`: loopback and Docker's 172.16.0.0/12 by
-  default), else the connection's own address. Each address may send 30
+  default, safe as only nginx and the backend share the stack's Docker
+  network and port 8000 isn't published), else the connection's own
+  address. Each address may send 30
   a minute and all of them 300; the rest are dropped with a 429, and one
   WARNING per address (or for all) and minute says how many. A report
   that is taken is a 204; one that can't be written (a full disk, a

@@ -71,6 +71,11 @@ MAX_SAFE_INTEGER = 2**53 - 1
 # string or fragment, which can hold inmate numbers.
 URL_KEYS = frozenset({"url", "source"})
 
+# Docker's private range holds nginx's address on the stack's network.
+# Trusting all of it is safe because only nginx and the backend are on that
+# network and port 8000 isn't published (deploy/pi/compose.yaml): nothing
+# else, but the Pi itself through the bridge's gateway, reaches the backend
+# directly to set X-Real-IP.
 DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8, ::1, 172.16.0.0/12"
 
 Level = Literal["WARNING", "ERROR", "CRITICAL"]
