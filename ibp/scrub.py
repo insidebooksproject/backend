@@ -2,8 +2,8 @@
 
 The patterns follow the error digest's redaction
 (``scripts/error-digest/ibp-error-digest``, a standalone script, so they
-are copied rather than imported): a URL's user and password, an
-Authorization scheme's credentials, the value of a ``key=``, ``token=``,
+are copied rather than imported): a URL's user and password, a ping or
+webhook URL's path, an Authorization scheme's credentials, the value of a ``key=``, ``token=``,
 ``password:`` ... pair (a quoted value whole, spaces and escaped quotes
 and all), a JWT, and any long run of base64 or hex with both letters and
 digits in it. A structured value whose key names a credential
@@ -29,20 +29,40 @@ import re
 SECRET = "<secret>"
 
 USERINFO = re.compile(r"(?<=://)[^\s/@]+@")
-AUTH_SCHEME = re.compile(r"\b(?P<scheme>Bearer|Basic|Token)\s+[\w.~+/=-]{8,}", re.I)
-# The key may be quoted (JSON: ``"password": "..."``); the separator stays
-# on one line; the value is a quoted string, whole (escaped quotes too, to
-# the end of the line if it isn't closed), or a run up to a separator, a
-# parenthesis or a frame's ``:line:col`` suffix. The key is tried only
-# at the start of a word (not at each ``-`` inside one, as ``\b`` would),
-# so a long ``a-a-a-...`` run costs one try, not one per dash.
+# Nothing between a scheme or key and its value crosses a line: a key at the
+# end of one line must not take the next line (a stack frame) as its value.
+AUTH_SCHEME = re.compile(r"\b(?P<scheme>Bearer|Basic|Token)[ \t]+[\w.~+/=-]{8,}", re.I)
+# As the digest's: a URL path that is itself the credential: a Healthchecks
+# check's ping URL (``hc-ping.com/<uuid>``, ``.../ping/<uuid>`` or
+# ``.../ping/<key>/<slug>``, any host) or a webhook's (``.../hooks/<token>``,
+# ``.../webhook/...``, ``hooks.slack.com/services/...``). Its secret part
+# is a segment of 16 or more [A-Za-z0-9_-]; the rest of the path (a slug,
+# ``/start``) goes with it, the ``:line:col`` of a stack frame stays.
+CREDENTIAL_PATH = re.compile(
+    r"(?P<prefix>(?<![\w.-])(?:hc-ping\.com|ping|hooks|webhooks?)/)"
+    r"[\w-]{16,}(?:/[^\s?#\"'<>:]*)?"
+    r"|(?P<slack>(?<![\w.-])hooks\.slack\.com/services/)[^\s?#\"'<>:]+",
+    re.I | re.A,
+)
+# As the digest's: the key may be quoted (JSON: ``"password": "..."``, or
+# JSON in a JSON string: ``\"password\": \"...\"``); the separator stays on
+# one line; the value is a quoted string, whole (escaped quotes too, to the
+# end of the line if it isn't closed; atomic, so it can't backtrack), or a
+# run up to a separator. Stricter than the digest's run: it also stops
+# before a parenthesis and a frame's ``:line:col`` suffix. The key is tried
+# only at the start of a word (not at each ``-`` inside one, as ``\b``
+# would), so a long ``a-a-a-...`` run costs one try, not one per dash.
 SECRET_PAIR = re.compile(
     r"(?P<key>(?<![\w-])[\w-]*(?:key|token|secret|password|passwd|pwd|signature|sig"
     r"|auth|authorization|session|cookie|credentials?)s?)"
-    r"(?P<sep>[\"']?[ \t]*[=:][ \t]*)(?!(?:Bearer|Basic|Token)\s)"
-    r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"?|'(?:[^'\\\n]|\\.)*'?"
+    r"(?P<sep>(?:\\?[\"'])?[ \t]*[=:][ \t]*)(?!(?:Bearer|Basic|Token)[ \t])"
+    r"(?P<value>"
+    # \"...\" (JSON in a JSON string): \\\" is an escaped quote inside it.
+    r"\\\"(?>\\\\\\\"|\\\\\\\\|\\[^\"\\\n]|[^\"\\\n])*(?:\\\"|$)"
+    r"|\"(?>\\[^\n]|[^\"\\\n])*\"?"
+    r"|'(?>\\[^\n]|[^'\\\n])*'?"
     r"|[^\s&\"',;<>()]+?(?=:\d+:\d+(?:[)\s]|$)|[\s&\"',;<>()]|$))",
-    re.I,
+    re.I | re.M,
 )
 JWT = re.compile(r"\beyJ[\w-]+\.[\w-]+(?:\.[\w-]+)?", re.A)
 TOKEN = re.compile(
@@ -86,6 +106,7 @@ def is_credential_key(key: str) -> bool:
 def scrub_secrets(text: str) -> str:
     """``text`` with each secret the patterns find replaced by ``<secret>``."""
     out = USERINFO.sub(f"{SECRET}@", text)
+    out = CREDENTIAL_PATH.sub(lambda m: f"{m['prefix'] or m['slack']}{SECRET}", out)
     out = AUTH_SCHEME.sub(lambda m: f"{m['scheme']} {SECRET}", out)
     out = SECRET_PAIR.sub(lambda m: f"{m['key']}{m['sep']}{SECRET}", out)
     out = JWT.sub(SECRET, out)

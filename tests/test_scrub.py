@@ -139,3 +139,45 @@ def test_credential_keys(key):
 def test_other_keys(key):
     """Keys that don't name a credential, ``key`` alone among them."""
     assert not is_credential_key(key)
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # Healthchecks ping URLs (synthetic ids), with what follows the id.
+        (
+            "GET https://hc-ping.com/0b1c2d3e-aaaa-4bbb-8ccc-1234567890ab/start failed",
+            "GET https://hc-ping.com/<secret> failed",
+        ),
+        (
+            "curl https://hc.example.org/ping/abcdefghijklmnop0123/backup-job",
+            "curl https://hc.example.org/ping/<secret>",
+        ),
+        (
+            "POST https://hooks.slack.com/services/T000/B000/XXXXXXXX failed",
+            "POST https://hooks.slack.com/services/<secret> failed",
+        ),
+        # A frame's :line:col stays.
+        (
+            "at f (http://ibp-server/webhook/abcdefghijklmnopqrst:3:4)",
+            "at f (http://ibp-server/webhook/<secret>:3:4)",
+        ),
+        # A short path segment isn't a credential.
+        ("GET /ping/ok", "GET /ping/ok"),
+    ],
+)
+def test_credential_paths_are_replaced(text, expected):
+    """A ping or webhook URL's path is the credential."""
+    assert scrub_secrets(text) == expected
+
+
+def test_json_in_a_json_string_is_replaced_whole():
+    """\\"password\\": \\"...\\" with an escaped quote inside it."""
+    text = r"{\"password\": \"a\\\"b c\", \"n\": 1}"
+    assert scrub_secrets(text) == r"{\"password\": <secret>, \"n\": 1}"
+
+
+def test_a_scheme_does_not_take_the_next_line():
+    """Bearer at the end of a line keeps the line after it."""
+    text = "expected Bearer\n    at checkAuthorization (a.js:1:2)"
+    assert scrub_secrets(text) == text
