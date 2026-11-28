@@ -22,9 +22,11 @@ import json
 import logging
 import os
 import socket
+import sys
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 APP = "backend"
 BACKEND_LOG_NAME = "backend.jsonl"
@@ -134,7 +136,9 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
         return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
 
 
-def open_log_file(name: str) -> RotatingFileHandler:
+def open_log_file(
+    name: str, handler_class: type[RotatingFileHandler] = PrivateRotatingFileHandler
+) -> RotatingFileHandler:
     """A size-rotated handler for ``name`` in the log directory, its file
     ``0640`` (a missing directory is made ``0750``).
 
@@ -142,7 +146,7 @@ def open_log_file(name: str) -> RotatingFileHandler:
     """
     log_dir = get_log_dir()
     log_dir.mkdir(mode=LOG_DIR_MODE, parents=True, exist_ok=True)
-    return PrivateRotatingFileHandler(
+    return handler_class(
         log_dir / name,
         maxBytes=LOG_MAX_BYTES,
         backupCount=LOG_BACKUP_COUNT,
@@ -171,6 +175,28 @@ def build_backend_handler() -> tuple[logging.Handler | None, str | None]:
     return handler, None
 
 
+class WriteFailed(Exception):
+    """A report couldn't be appended (a full disk, a failed rotation)."""
+
+
+class _ObservedFileHandler(PrivateRotatingFileHandler):
+    """Keeps the error an ``emit`` failed with, instead of printing it."""
+
+    failure: BaseException | None = None
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        self.failure = sys.exc_info()[1]
+
+
+class _ObservedStreamHandler(logging.StreamHandler):
+    """Keeps the error an ``emit`` failed with, instead of printing it."""
+
+    failure: BaseException | None = None
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        self.failure = sys.exc_info()[1]
+
+
 class ClientErrorLog:
     """Appends browser reports to ``client-errors.jsonl``.
 
@@ -178,36 +204,73 @@ class ClientErrorLog:
     can't be opened, reports go to stderr instead, so they are at least in
     ``docker compose logs``, and the failure is said once. The handler is
     called directly, not through a logger, so no logging configuration
-    (levels, disabled loggers) can drop a report.
+    (levels, disabled loggers) can drop a report. A write that fails once
+    the file is open (a full disk, a failed rotation) raises
+    :class:`WriteFailed`; the first of a run of failures is logged.
     """
 
     def __init__(self) -> None:
-        self._handler: logging.Handler | None = None
+        self._handler: _ObservedFileHandler | _ObservedStreamHandler | None = None
+        self._lock = threading.Lock()
+        self._failing = False
 
     def open(self) -> logging.Handler:
         """Open the file, or fall back to stderr; once."""
+        with self._lock:
+            return self._open()
+
+    def _open(self) -> _ObservedFileHandler | _ObservedStreamHandler:
         if self._handler is not None:
             return self._handler
-        handler: logging.Handler
+        handler: _ObservedFileHandler | _ObservedStreamHandler
         try:
-            handler = open_log_file(CLIENT_LOG_NAME)
+            handler = cast(
+                _ObservedFileHandler,
+                open_log_file(CLIENT_LOG_NAME, _ObservedFileHandler),
+            )
         except OSError as error:
             logger.warning("%s", unavailable_message(CLIENT_LOG_NAME, error))
-            handler = logging.StreamHandler()
+            handler = _ObservedStreamHandler()
         handler.setFormatter(EventFormatter())
         self._handler = handler
         return handler
 
     def close(self) -> None:
         """Close the file; the next write opens it again."""
-        if self._handler is not None:
-            self._handler.close()
-            self._handler = None
+        with self._lock:
+            if self._handler is not None:
+                self._handler.close()
+                self._handler = None
+            self._failing = False
 
     def write(self, event: dict[str, Any]) -> None:
-        """Append one event."""
+        """Append one event; raises :class:`WriteFailed` if it wasn't."""
         record = logging.makeLogRecord({"msg": "client error", "event": event})
-        self.open().handle(record)
+        with self._lock:
+            handler = self._open()
+            handler.failure = None
+            handler.handle(record)
+            failure, handler.failure = handler.failure, None
+            if failure is None:
+                self._failing = False
+                return
+            if not self._failing:
+                self._failing = True
+                logger.warning(
+                    "Not writing %s: %s; reports are refused (503) until it "
+                    "can be written",
+                    CLIENT_LOG_NAME,
+                    describe_write_failure(failure),
+                )
+        raise WriteFailed(type(failure).__name__) from failure
+
+
+def describe_write_failure(error: BaseException) -> str:
+    """A write failure without the event's text: an ``OSError``'s errno
+    message (``[Errno 28] No space left on device``), else the class name."""
+    if isinstance(error, OSError) and error.strerror:
+        return f"[Errno {error.errno}] {error.strerror}"
+    return type(error).__name__
 
 
 client_error_log = ClientErrorLog()

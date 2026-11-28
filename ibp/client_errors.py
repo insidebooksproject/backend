@@ -12,6 +12,8 @@ each error here as one event of the shared format without ``ts`` and
 - At most 30 reports a minute are taken from one address. Over that they
   are dropped with a 429, and one WARNING per address and minute says how
   many were.
+- A report that can't be written once the file is open (a full disk, a
+  failed rotation) is a 503.
 """
 
 import asyncio
@@ -26,9 +28,10 @@ from typing import Any, Literal
 from fastapi import Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from starlette.concurrency import run_in_threadpool
 
 from .base import app
-from .error_log import client_error_log, timestamp
+from .error_log import WriteFailed, client_error_log, timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -200,5 +203,14 @@ async def report_client_error(request: Request) -> Response:
         "exc": report.exc,
         "data": report.data,
     }
-    client_error_log.write({k: v for k, v in event.items() if v is not None})
+    try:
+        await run_in_threadpool(
+            client_error_log.write, {k: v for k, v in event.items() if v is not None}
+        )
+    except WriteFailed:
+        return Response(
+            content=json.dumps({"detail": "Report not recorded."}),
+            media_type="application/json",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -2,8 +2,10 @@
 
 # pylint: disable=redefined-outer-name
 
+import errno
 import json
 import logging
+import logging.handlers
 import os
 import re
 import stat
@@ -265,6 +267,51 @@ def test_unwritable_log_dir_falls_back_to_stderr(
     assert response.status_code == 204
     err = capsys.readouterr().err
     assert '"msg": "kept"' in err
+
+
+def no_space(*_args, **_kwargs):
+    """A write to a full disk."""
+    raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+
+def test_full_disk_after_open_is_503(client, log_dir, monkeypatch, caplog):
+    """Once the file is open, a write that fails is a 503, said once (with
+    no report text) until a write succeeds again."""
+    caplog.set_level(logging.WARNING, logger="ibp.error_log")
+    assert client.post("/client-errors", json=report(msg="first")).status_code == 204
+    handler = client_error_log.open()
+    assert isinstance(handler, logging.FileHandler)
+    monkeypatch.setattr(handler.stream, "write", no_space)
+    for _ in range(2):
+        response = client.post("/client-errors", json=report(msg="secret"))
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Report not recorded."}
+    failures = [r for r in caplog.records if r.name == "ibp.error_log"]
+    assert [r.getMessage() for r in failures] == [
+        "Not writing client-errors.jsonl: [Errno 28] No space left on device; "
+        "reports are refused (503) until it can be written"
+    ]
+    assert "secret" not in caplog.text
+
+    monkeypatch.undo()
+    assert client.post("/client-errors", json=report(msg="again")).status_code == 204
+    assert [event["msg"] for event in events(log_dir)] == ["first", "again"]
+
+
+def test_failed_rotation_is_503(client, monkeypatch):
+    """A rotation that fails (the rename refused) is a 503, not a 204."""
+    assert client.post("/client-errors", json=report()).status_code == 204
+    handler = client_error_log.open()
+    assert isinstance(handler, logging.handlers.RotatingFileHandler)
+    monkeypatch.setattr(handler, "maxBytes", 10)
+
+    def refuse(_source, _dest):
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+
+    monkeypatch.setattr(handler, "rotator", refuse)
+    assert client.post("/client-errors", json=report()).status_code == 503
+    monkeypatch.undo()
+    assert client.post("/client-errors", json=report()).status_code == 204
 
 
 def test_client_log_file_is_0640(client, log_dir):

@@ -120,7 +120,9 @@ values (`hide_parameters`), as both can hold inmate data:
   and `app` is `frontend` or `book-portal-extension`, else it is a 422. A
   body over 16 KiB is a 413. Each address may send 30 a minute; the rest
   are dropped with a 429, and one WARNING per address and minute says how
-  many. A report that is taken is a 204.
+  many. A report that is taken is a 204; one that can't be written (a
+  full disk, a failed rotation) is a 503, and the first of a run of such
+  failures is logged.
 
 If the directory can't be written, the backend still starts: it says so on
 stderr, and writes the browser reports to stderr instead.
