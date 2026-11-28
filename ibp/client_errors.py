@@ -49,7 +49,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .base import app, config
 from .error_log import WriteFailed, client_error_log, timestamp
-from .scrub import SECRET, is_credential_key, scrub_secrets
+from .scrub import SECRET, is_credential_key, scrub_location, scrub_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,10 @@ def clean_data(data: dict[str, Any]) -> dict[str, Any] | None:
             cleaned[key] = [item for _, item in items]
             continue
         if key in URL_KEYS and isinstance(value, str):
-            value = strip_query(value)
+            # Scrubbed here, keeping a source's :line:col.
+            value = truncate(scrub_location(strip_query(value)), MAX_DATA_TEXT_CHARS)
+            cleaned[key] = value
+            continue
         ok, scalar = clean_scalar(value)
         if not ok:
             continue

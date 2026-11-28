@@ -767,3 +767,18 @@ def test_a_frame_after_a_credential_word_is_kept(client, log_dir):
     assert client.post("/client-errors", json=report(exc=exc)).status_code == 204
     (event,) = events(log_dir)
     assert event["exc"] == exc
+
+
+def test_source_keeps_its_position_and_other_digits_go(client, log_dir):
+    """data.source keeps :line:col; a value elsewhere doesn't keep digits
+    that look like one."""
+    body = report(
+        msg="refused token=example:123:456",
+        data={"source": "http://ibp-server/assets/index-DkS8f3jK.js:12:34"},
+    )
+    assert client.post("/client-errors", json=body).status_code == 204
+    (event,) = events(log_dir)
+    assert event["msg"] == "refused token=<secret>"
+    assert event["data"] == {
+        "source": "http://ibp-server/assets/index-DkS8f3jK.js:12:34"
+    }
