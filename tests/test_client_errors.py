@@ -465,12 +465,15 @@ def test_data_is_bounded(client, log_dir):
         ),
         (
             {"source": "http://ibp-server/assets/index-abc.js?v=1#x:12:34"},
-            {"source": "http://ibp-server/assets/index-abc.js:12:34"},
+            {"source": "http://ibp-server/assets/index-abc.js"},
         ),
         (
             {"source": "http://ibp-server/a.js:5:6"},
             {"source": "http://ibp-server/a.js:5:6"},
         ),
+        # Digits after the query go with it: no :line:col is split off.
+        ({"url": "/lookup?token=example:123:456"}, {"url": "/lookup"}),
+        ({"source": "http://h/a.js?token=example:12:34"}, {"source": "http://h/a.js"}),
         ({"nested": {"a": 1}}, None),
     ],
 )
@@ -769,9 +772,9 @@ def test_a_frame_after_a_credential_word_is_kept(client, log_dir):
     assert event["exc"] == exc
 
 
-def test_source_keeps_its_position_and_other_digits_go(client, log_dir):
-    """data.source keeps :line:col; a value elsewhere doesn't keep digits
-    that look like one."""
+def test_source_without_a_query_is_kept_and_a_value_takes_its_digits(client, log_dir):
+    """data.source without a query keeps its :line:col; a credential value
+    elsewhere is replaced with the digits after it."""
     body = report(
         msg="refused token=example:123:456",
         data={"source": "http://ibp-server/assets/index-DkS8f3jK.js:12:34"},

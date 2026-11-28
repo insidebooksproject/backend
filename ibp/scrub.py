@@ -18,14 +18,11 @@ index-DkS8f3jK.js``, ``python3.13/site-packages``) are never taken for a
 token. A base64 secret with a ``/`` in it is still caught by its key
 (``key=``, ``Bearer``) where it has one.
 
-Stack frames survive. No pattern crosses a line (``missing cookie:`` then
-a frame on the next line keeps the frame's ``at``), so text is scrubbed a
-line at a time. A line that is a JavaScript stack frame (Chrome's ``at f
-(url:line:col)``, Firefox's ``f@url:line:col``) has its URL scrubbed apart
-from its ``:line[:col]`` and what follows, so ``at r
-(http://host/app.js?token=abc:12:34)`` keeps ``:12:34)``; so does a
-``data.source`` (:func:`scrub_location`). Anywhere else digits after a
-value are part of it: ``token=example:123:456`` is ``token=<secret>``.
+No pattern crosses a line, so a key at the end of one line (``missing
+cookie:``) never takes the next one (a stack frame's ``at ...``) as its
+value. Every line is scrubbed the same way, stack frames too: a value is
+replaced whole, digits after it included (``token=example:123:456`` is
+``token=<secret>``, in a frame's URL as anywhere).
 """
 
 import re
@@ -106,57 +103,8 @@ def is_credential_key(key: str) -> bool:
     return any(word in CREDENTIAL_WORDS for word in words) or "apikey" in pairs
 
 
-# A JavaScript stack frame on a line of its own: Chrome's (``at f
-# (url:line:col)``, ``at url:line:col``) and Firefox's (``f@url:line:col``),
-# the URL with a scheme (``http://``, ``moz-extension://``) or a path.
-CHROME_FRAME = re.compile(
-    r"(?P<head>[ \t]*at (?:[^\n]+? \()?)(?P<url>(?:[A-Za-z][\w+.-]*://|/)[^\s()]*?)"
-    r"(?P<position>:\d+(?::\d+)?)(?P<tail>\)?[ \t]*)"
-)
-FIREFOX_FRAME = re.compile(
-    r"(?P<head>[ \t]*[^@\s]*@)(?P<url>(?:[A-Za-z][\w+.-]*://|/)\S*?)"
-    r"(?P<position>:\d+(?::\d+)?)(?P<tail>[ \t]*)"
-)
-# Frames are short; a longer line isn't tried as one (and can't make the
-# frame patterns backtrack for long).
-MAX_FRAME_CHARS = 2000
-# A source location: ``url:line[:col]``.
-LOCATION = re.compile(r"(?P<url>.*?)(?P<position>:\d+(?::\d+)?)", re.S)
-
-
 def scrub_secrets(text: str) -> str:
-    """``text`` with each secret the patterns find replaced by
-    ``<secret>``, a line at a time; a stack frame keeps its position."""
-    return "".join(_scrub_line(line) for line in text.splitlines(keepends=True))
-
-
-def scrub_location(text: str) -> str:
-    """A source location (``url:line[:col]``, as ``data.source``) scrubbed
-    apart from its ``:line[:col]``."""
-    match = LOCATION.fullmatch(text)
-    if match is None:
-        return scrub_secrets(text)
-    return scrub_secrets(match["url"]) + match["position"]
-
-
-def _scrub_line(line: str) -> str:
-    body = line.rstrip("\r\n")
-    ending = line[len(body) :]
-    if len(body) <= MAX_FRAME_CHARS:
-        for frame in (CHROME_FRAME, FIREFOX_FRAME):
-            match = frame.fullmatch(body)
-            if match:
-                return (
-                    _scrub(match["head"])
-                    + _scrub(match["url"])
-                    + match["position"]
-                    + match["tail"]
-                    + ending
-                )
-    return _scrub(body) + ending
-
-
-def _scrub(text: str) -> str:
+    """``text`` with each secret the patterns find replaced by ``<secret>``."""
     out = USERINFO.sub(f"{SECRET}@", text)
     out = CREDENTIAL_PATH.sub(lambda m: f"{m['prefix'] or m['slack']}{SECRET}", out)
     out = AUTH_SCHEME.sub(lambda m: f"{m['scheme']} {SECRET}", out)

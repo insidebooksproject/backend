@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from ibp.scrub import is_credential_key, scrub_location, scrub_secrets
+from ibp.scrub import is_credential_key, scrub_secrets
 
 
 @pytest.mark.parametrize(
@@ -77,15 +77,6 @@ def test_a_quoted_value_with_escaped_quotes_is_replaced_whole():
             "missing password=\n    at f (a.js:1:2)",
             "missing password=\n    at f (a.js:1:2)",
         ),
-        # A frame's :line:col and closing parenthesis are kept.
-        (
-            "    at r (http://ibp-server/a.js?token=abc123:12:34)",
-            "    at r (http://ibp-server/a.js?token=<secret>:12:34)",
-        ),
-        (
-            "fetchToken@http://ibp-server/a.js?api_key=zz:3:4",
-            "fetchToken@http://ibp-server/a.js?api_key=<secret>:3:4",
-        ),
         # An unclosed quote ends with its line.
         (
             'password: "abc\n    at f (a.js:1:2)',
@@ -94,7 +85,7 @@ def test_a_quoted_value_with_escaped_quotes_is_replaced_whole():
     ],
 )
 def test_stack_frames_survive(text, expected):
-    """Frames' "at", file:line:col suffixes and URL paths are kept."""
+    """A frame on the line after a credential word keeps its "at"."""
     assert scrub_secrets(text) == expected
 
 
@@ -186,51 +177,26 @@ def test_a_scheme_does_not_take_the_next_line():
 @pytest.mark.parametrize(
     "text, expected",
     [
-        # Outside a frame the digits belong to the value.
+        # Digits after a value are part of it, in a frame as anywhere.
         ("refused token=example:123:456", "refused token=<secret>"),
         ("token=example:123:456\nnext", "token=<secret>\nnext"),
         ("    at token=example:123:456", "    at token=<secret>"),
         ("f@token=example:1:2", "f@token=<secret>"),
-        # In a frame they are the position.
         (
             "    at r (https://ibp-server/a.js?token=example:123:456)",
-            "    at r (https://ibp-server/a.js?token=<secret>:123:456)",
-        ),
-        (
-            "    at https://ibp-server/a.js?token=example:12",
-            "    at https://ibp-server/a.js?token=<secret>:12",
+            "    at r (https://ibp-server/a.js?token=<secret>",
         ),
         (
             "r@moz-extension://abc/content.js?api_key=zz:3:4",
-            "r@moz-extension://abc/content.js?api_key=<secret>:3:4",
+            "r@moz-extension://abc/content.js?api_key=<secret>",
         ),
+        # A frame without a secret is left alone, position and all.
         (
-            "Error: x\r\n    at async Foo.bar (/app/a.js?sig=abc:1:2)\r\n",
-            "Error: x\r\n    at async Foo.bar (/app/a.js?sig=<secret>:1:2)\r\n",
+            "Error: x\r\n    at async Foo.bar (/app/a.js:1:2)\r\n",
+            "Error: x\r\n    at async Foo.bar (/app/a.js:1:2)\r\n",
         ),
     ],
 )
-def test_positions_are_kept_only_in_frames(text, expected):
-    """``:line[:col]`` survives only in a recognised stack frame."""
+def test_a_value_is_replaced_with_its_digits(text, expected):
+    """No ``:line:col`` is split off a credential value, in a frame or not."""
     assert scrub_secrets(text) == expected
-
-
-@pytest.mark.parametrize(
-    "text, expected",
-    [
-        ("http://h/a.js?token=abc:12:34", "http://h/a.js?token=<secret>:12:34"),
-        ("http://h/a.js:5", "http://h/a.js:5"),
-        ("token=abc", "token=<secret>"),
-    ],
-)
-def test_a_source_location_keeps_its_position(text, expected):
-    """data.source is url:line[:col]; the position is kept."""
-    assert scrub_location(text) == expected
-
-
-def test_a_long_frame_like_line_is_cheap():
-    """A long line of "at ( ( (" can't make the frame patterns backtrack."""
-    start = time.perf_counter()
-    scrub_secrets("    at " + "x (" * 5000)
-    scrub_secrets("    at " + "x (" * 600 + "http://h/" + "a" * 100)
-    assert time.perf_counter() - start < 0.5

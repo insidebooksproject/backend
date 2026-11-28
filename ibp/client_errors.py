@@ -49,7 +49,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .base import app, config
 from .error_log import WriteFailed, client_error_log, timestamp
-from .scrub import SECRET, is_credential_key, scrub_location, scrub_secrets
+from .scrub import SECRET, is_credential_key, scrub_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +67,8 @@ MAX_DATA_LIST_ITEMS = 20
 # Integers beyond this are refused like non-finite floats: no JSON reader
 # keeps them exact.
 MAX_SAFE_INTEGER = 2**53 - 1
-# data keys that hold a URL (or ``url:line:col``), kept without the query
-# string or fragment, which can hold inmate numbers.
+# data keys that hold a URL (``source``: ``url:line:col``), kept without the
+# query string or fragment.
 URL_KEYS = frozenset({"url", "source"})
 
 # Docker's private range holds nginx's address on the stack's network.
@@ -88,11 +88,10 @@ def truncate(text: str, limit: int) -> str:
 
 
 def strip_query(value: str) -> str:
-    """A URL (or ``url:line:col``) without its query string or fragment."""
-    match = re.fullmatch(r"(.*?)((?::\d+){1,2})?", value, flags=re.DOTALL)
-    url, position = (match.group(1), match.group(2) or "") if match else (value, "")
-    parts = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit(parts._replace(query="", fragment="")) + position
+    """A URL without its query string or fragment (anything after the first
+    ``?`` or ``#``, ``:line:col`` digits too)."""
+    parts = urllib.parse.urlsplit(value)
+    return urllib.parse.urlunsplit(parts._replace(query="", fragment=""))
 
 
 def clean_scalar(value: Any) -> tuple[bool, Scalar]:
@@ -128,10 +127,7 @@ def clean_data(data: dict[str, Any]) -> dict[str, Any] | None:
             cleaned[key] = [item for _, item in items]
             continue
         if key in URL_KEYS and isinstance(value, str):
-            # Scrubbed here, keeping a source's :line:col.
-            value = truncate(scrub_location(strip_query(value)), MAX_DATA_TEXT_CHARS)
-            cleaned[key] = value
-            continue
+            value = strip_query(value)
         ok, scalar = clean_scalar(value)
         if not ok:
             continue
