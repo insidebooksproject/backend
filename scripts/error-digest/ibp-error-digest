@@ -422,16 +422,21 @@ def fingerprint(
     message: str,
     logger: str | None = None,
     status: int | None = None,
+    operation: str | None = None,
 ) -> str:
     """The group key: for a browser app, where it was reported (``logger``),
-    the HTTP status, the exception type and the message's shape, since its
+    the API operation and HTTP status, the exception type and the message's
+    shape, since its
     frames are minified or shared by every API call; for any other app with
     an exception, the type and the innermost IBP frame; else the message's
     shape."""
     frame = stack.innermost() if stack else None
     if app in BROWSER_APPS:
         kind = stack.type if stack else ""
-        key = f"{app}|browser|{logger or ''}|{status or ''}|{kind}|{normalize(message)}"
+        key = (
+            f"{app}|browser|{logger or ''}|{operation or ''}|{status or ''}|{kind}"
+            f"|{normalize(message)}"
+        )
     elif stack and (stack.type or frame):
         where = f"{frame.file}:{frame.func}" if frame else ""
         key = f"{app}|exc|{stack.type}|{where}"
@@ -459,6 +464,7 @@ class Event:
     logger: str | None = None
     failed_unit: bool = False
     status: int | None = None  # a browser app's data.status (HTTP)
+    operation: str | None = None  # a browser app's data.operation
 
 
 @dataclass
@@ -734,12 +740,14 @@ def shared_event(obj: Any, source: str, app: str, host: str) -> Event | None:
         return None
     app = clean_name(obj.get("app")) or app
     message = redact(obj.get("msg"))
-    status = None
+    status = operation = None
     data = obj.get("data")
     if app in BROWSER_APPS and isinstance(data, dict):
         value = data.get("status")
         if isinstance(value, int) and not isinstance(value, bool):
             status = value if 100 <= value <= 599 else None
+        # The API call that failed (the extension's "api.books.get").
+        operation = clean_name(data.get("operation"))
     return Event(
         ts=ts,
         level=level,
@@ -751,6 +759,7 @@ def shared_event(obj: Any, source: str, app: str, host: str) -> Event | None:
         version=clean_version(obj.get("version")),
         logger=clean_name(obj.get("logger")),
         status=status,
+        operation=operation,
     )
 
 
@@ -1314,6 +1323,7 @@ class Group:
     source: str = ""
     status: str = ""
     http_status: int | None = None
+    operation: str | None = None
     last_week: int = 0
     first_seen: str = ""
     failed_unit: bool = False
@@ -1334,6 +1344,7 @@ class Group:
             self.stack = event.stack
             self.source = event.source
             self.http_status = event.status
+            self.operation = event.operation
         self.failed_unit = self.failed_unit or event.failed_unit
 
 
@@ -1341,7 +1352,12 @@ def group_events(events: list[Event]) -> dict[str, Group]:
     groups: dict[str, Group] = {}
     for event in events:
         fp = fingerprint(
-            event.app, event.stack, event.message, event.logger, event.status
+            event.app,
+            event.stack,
+            event.message,
+            event.logger,
+            event.status,
+            event.operation,
         )
         groups.setdefault(fp, Group(fp, event.app)).add(event)
     return groups
@@ -1503,6 +1519,7 @@ def group_json(group: Group) -> dict:
             else None
         ),
         "http_status": group.http_status,
+        "operation": group.operation,
         "frames": [f.text() for f in stack.frames[-MAX_FRAMES:]] if stack else [],
         # path:line for --show-raw, a journalctl/systemctl command, or None
         # (a file whose name --show-raw would refuse).
@@ -1653,6 +1670,8 @@ def render_markdown(report: dict) -> str:
         out += [
             f"- logger: {code(g['logger'] or '')}",
         ]
+        if g["operation"]:
+            out.append(f"- operation: {code(g['operation'])}")
         if g["http_status"]:
             out.append(f"- HTTP status: {g['http_status']}")
         out += [

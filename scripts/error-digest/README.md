@@ -69,8 +69,10 @@ no raw path.
    message changing doesn't make a new group), or, for an event with no
    exception, its redacted message with numbers and codes replaced. The
    browser apps (`frontend`, `book-portal-extension`) are grouped by their
-   `logger` (where the error was reported), `data.status` (the HTTP status,
-   shown as `http_status`), exception type and message shape instead: every
+   `logger` (where the error was reported), `data.operation` (the API call,
+   e.g. the extension's `api.books.get`, shown as `operation`),
+   `data.status` (the HTTP status, shown as `http_status`), exception type
+   and message shape instead: every
    API call fails in the same response helper, and the frontend's frames
    are minified (their function names are left out of the stack shown).
 2. **Status**, from `/var/lib/ibp-error-digest/seen.json` (fingerprint ->
@@ -103,7 +105,8 @@ no raw path.
    for a file with an unusual name. Digests older than 26 weeks are
    removed.
 
-**Redaction.** No `data` field (but a browser app's numeric `status`),
+**Redaction.** No `data` field (but a browser app's numeric `status` and
+plain-name `operation`),
 request body or raw line is ever copied. In each message and exception
 line: secrets become `<secret>` (a URL's `user:password@`, `Bearer`/`Basic`
 credentials, the value of `key=`, `token=`, `password:` and the like, JWTs,

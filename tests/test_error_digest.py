@@ -363,6 +363,44 @@ def test_browser_status_comes_from_data_and_is_shown(tree):
     assert "- HTTP status: 502" in markdown
 
 
+def test_extension_operations_split_groups_and_are_shown(tree):
+    def report(hours, operation, status=502):
+        return event(
+            NOW - timedelta(hours=hours),
+            app="book-portal-extension",
+            logger="background",
+            msg=f"IBP server HTTP {status}",
+            data={"status": status, "operation": operation},
+            host="192.0.2.26",
+        )
+
+    write_jsonl(
+        tree["server"] / "client-errors.jsonl",
+        [
+            report(1, "api.books.get"),
+            report(2, "api.books.get", 503),
+            report(3, "api.requests.portal-registrations.post"),
+            report(4, "api.books.get", 503),
+            report(5, ["not", "a name"]),
+        ],
+    )
+    _, report_, markdown = run(tree)
+    groups = {(g["operation"], g["http_status"]): g["count"] for g in report_["groups"]}
+    assert groups == {
+        ("api.books.get", 502): 1,
+        ("api.books.get", 503): 2,
+        ("api.requests.portal-registrations.post", 502): 1,
+        (None, 502): 1,
+    }
+    assert "- operation: `api.books.get`" in markdown
+    stack = None
+    assert digest.fingerprint(
+        "book-portal-extension", stack, "x", "background", 502, "api.books.get"
+    ) != digest.fingerprint(
+        "book-portal-extension", stack, "x", "background", 502, "api.books.upc.get"
+    )
+
+
 def test_messages_without_exception_group_by_their_shape():
     one = digest.redact("printer BOB offline after 12 tries for TEX-01234567-2")
     two = digest.redact("printer BOB offline after 3 tries for TEX-7654321-0")
