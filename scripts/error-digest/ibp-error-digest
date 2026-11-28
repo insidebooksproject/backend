@@ -172,22 +172,44 @@ QUOTED = re.compile(
 )
 KEYWORD = re.compile(r"\w*(?:address|name|inmate)\w*", re.I)
 DIGITS = re.compile(r"\d{4,}")
-# Secrets: a URL's user and password, an Authorization scheme's credentials,
-# the value of a key=, token=, password: ... pair, a JWT, and a long random
-# run of characters (TOKEN).
+# Secrets: a URL's user and password, a ping or webhook URL's path, an
+# Authorization scheme's credentials, the value of a key=, token=,
+# password: ... pair, a JWT, and a long random run of characters (TOKEN).
 USERINFO = re.compile(r"(?<=://)[^\s/@]+@")
-AUTH_SCHEME = re.compile(r"\b(?P<scheme>Bearer|Basic|Token)\s+[\w.~+/=-]{8,}", re.I)
+# Nothing between a scheme or key and its value crosses a line: a key at the
+# end of one line must not take the next line (a stack frame) as its value.
+AUTH_SCHEME = re.compile(r"\b(?P<scheme>Bearer|Basic|Token)[ \t]+[\w.~+/=-]{8,}", re.I)
+# A URL path that is itself the credential: a Healthchecks check's ping URL
+# (``hc-ping.com/<uuid>``, ``.../ping/<uuid>`` or ``.../ping/<key>/<slug>``,
+# any host) or a webhook's (``.../hooks/<token>``, ``.../webhook/...``,
+# ``hooks.slack.com/services/...``).
+# Its secret part is a segment of 16 or more [A-Za-z0-9_-]; the rest of
+# the path (a slug, ``/start``) goes with it, the ``:line:col`` of a stack
+# frame stays. An ordinary UUID elsewhere is kept.
+CREDENTIAL_PATH = re.compile(
+    r"(?P<prefix>(?<![\w.-])(?:hc-ping\.com|ping|hooks|webhooks?)/)"
+    r"[\w-]{16,}(?:/[^\s?#\"'<>:]*)?"
+    r"|(?P<slack>(?<![\w.-])hooks\.slack\.com/services/)[^\s?#\"'<>:]+",
+    re.I | re.A,
+)
 # As backend ibp/scrub.py (the intake's): the key may be quoted (JSON:
-# ``"password": "..."``); the value is a quoted string, whole, or a run up
-# to a separator. The key is tried only at the start of a word (not at each
-# ``-`` inside one, as ``\b`` would), so a long ``a-a-a-...`` run costs one
-# try, not one per dash.
+# ``"password": "..."``, or JSON in a JSON string: ``\"password\": \"...\"``);
+# the value is a quoted string, whole, escaped quotes in it included, or a
+# run up to a separator. The key is tried only at the start of a word (not
+# at each ``-`` inside one, as ``\b`` would), so a long ``a-a-a-...`` run
+# costs one try, not one per dash; the quoted values are atomic, so they
+# can't backtrack.
 SECRET_PAIR = re.compile(
     r"(?P<key>(?<![\w-])[\w-]*(?:key|token|secret|password|passwd|pwd|signature|sig"
     r"|auth|authorization|session|cookie|credentials?)s?)"
-    r"(?P<sep>[\"']?\s*[=:]\s*)(?!(?:Bearer|Basic|Token)\s)"
-    r"(?P<value>\"[^\"]*\"?|'[^']*'?|[^\s&\"',;<>]+)",
-    re.I,
+    r"(?P<sep>(?:\\?[\"'])?[ \t]*[=:][ \t]*)(?!(?:Bearer|Basic|Token)[ \t])"
+    r"(?P<value>"
+    # \"...\" (JSON in a JSON string): \\\" is an escaped quote inside it.
+    r"\\\"(?>\\\\\\\"|\\\\\\\\|\\[^\"\\\n]|[^\"\\\n])*(?:\\\"|$)"
+    r"|\"(?>\\[^\n]|[^\"\\\n])*\"?"
+    r"|'(?>\\[^\n]|[^'\\\n])*'?"
+    r"|[^\s&\"',;<>]+)",
+    re.I | re.M,
 )
 JWT = re.compile(r"\beyJ[\w-]+\.[\w-]+(?:\.[\w-]+)?", re.A)
 # Stricter than ibp/scrub.py's TOKEN (one digit and one letter), since the
@@ -254,6 +276,7 @@ def scrub(text: str) -> str:
     # A lone surrogate (an escaped one passes json.loads) can't be written.
     out = text.encode("utf-8", "replace").decode("utf-8")
     out = USERINFO.sub("<secret>@", out)
+    out = CREDENTIAL_PATH.sub(lambda m: f"{m['prefix'] or m['slack']}<secret>", out)
     out = AUTH_SCHEME.sub(lambda m: f"{m['scheme']} <secret>", out)
     out = SECRET_PAIR.sub(lambda m: f"{m['key']}{m['sep']}<secret>", out)
     out = JWT.sub("<secret>", out)

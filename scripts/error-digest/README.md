@@ -114,10 +114,14 @@ no raw path.
 **Redaction.** No `data` field (but a browser app's numeric `status` and
 plain-name `operation`),
 request body or raw line is ever copied. In each message and exception
-line: secrets become `<secret>` (a URL's `user:password@`, `Bearer`/`Basic`
+line: secrets become `<secret>` (a URL's `user:password@`, a URL path that
+is the credential: a Healthchecks ping URL, `hc-ping.com/<uuid>` or
+`.../ping/<uuid-or-key>/...` on any host, and webhook paths, `.../hooks/`,
+`.../webhook(s)/`, `hooks.slack.com/services/...`; `Bearer`/`Basic`
 credentials, the value of `key=`, `token=`, `password:` and the like (a
-quoted value whole, and a JSON-quoted key too; the same pattern as the
-intake's `ibp/scrub.py`), JWTs,
+quoted value whole, escaped quotes in it included, and a JSON-quoted or
+JSON-in-JSON-quoted key too, never across a line break; the same pattern
+as the intake's `ibp/scrub.py`), JWTs,
 runs of 24 or more of `A-Z a-z 0-9 _ + = -` with two capitals, two small
 letters and two digits, and runs of 32 or more mixed hex digits); and
 e-mail addresses become `<email>`. The same secret patterns then run over

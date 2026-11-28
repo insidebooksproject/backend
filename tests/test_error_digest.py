@@ -1834,3 +1834,100 @@ def test_scrub_of_a_long_run_is_cheap(text):
     digest.scrub(text)
     digest.redact(text, limit=len(text))
     assert time.perf_counter() - start < 0.5
+
+
+PING = "https://hc.example/ping/9f86d081-884c-7d65-9a2f-eaa0c55ad015"
+PING_UUID = "9f86d081-884c-7d65-9a2f-eaa0c55ad015"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (f"ping {PING} failed", "ping https://hc.example/ping/<secret> failed"),
+        (f"{PING}/start: 503", "https://hc.example/ping/<secret>: 503"),
+        ("https://hc.example/ping/AbCdEfGhIjKlMnOpQrStUv/backup-nightly 200",
+         "https://hc.example/ping/<secret> 200"),
+        (f"GET https://hc-ping.com/{PING_UUID}/1", "GET https://hc-ping.com/<secret>"),
+        (f"at f ({PING}:1:2)", "at f (https://hc.example/ping/<secret>:1:2)"),
+        ("https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXXXXXXXXXXXXXX",
+         "https://hooks.slack.com/services/<secret>"),
+        ("https://x.example/api/webhooks/abcdefghijklmnop1234/y",
+         "https://x.example/api/webhooks/<secret>"),
+        # An ordinary UUID, and a module called ping, are kept.
+        (f"request {PING_UUID} done", f"request {PING_UUID} done"),
+        ("shippy/core/ping/utils.py:3 run", "shippy/core/ping/utils.py:3 run"),
+    ],
+)  # fmt: skip
+def test_scrub_credential_urls(text, expected):
+    assert digest.scrub(text) == expected
+
+
+def test_a_ping_url_never_reaches_the_digest_or_the_state(tree):
+    exc = (
+        "Traceback (most recent call last):\n"
+        '  File "/usr/local/bin/ibp-backup", line 9, in ping\n'
+        "    urlopen(url)\n"
+        f"urllib.error.HTTPError: HTTP Error 404 for {PING}/start\n"
+    )
+    js = f"TypeError: x\n    at f ({PING}:1:2)\n"
+    write_jsonl(
+        tree["root"] / "IBP_LAPTOP" / "errors-shippy.jsonl",
+        [
+            event(NOW - timedelta(hours=1), msg=f"healthchecks ping {PING} failed"),
+            event(NOW - timedelta(hours=2), exc=exc),
+        ],
+    )
+    write_jsonl(
+        tree["server"] / "client-errors.jsonl",
+        [event(NOW - timedelta(hours=1), app="frontend", msg="TypeError: x", exc=js)],
+    )
+    _, report, _ = run(tree)
+    assert report["summary"]["events"] == 3
+    frames = [f for g in report["groups"] for f in g["frames"]]
+    assert "ping/<secret>:1 f" in frames
+    for name in ("2026-W48.md", "2026-W48.json"):
+        assert PING_UUID not in (tree["digest"] / name).read_text()
+    assert PING_UUID not in (tree["state"] / "seen.json").read_text()
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ('password: "a\\"b c" ok', "password: <secret> ok"),
+        ("password='a\\'b c' tail", "password=<secret> tail"),
+        ('{\\"password\\": \\"a\\\\\\"b c\\", \\"n\\": 1}',
+         '{\\"password\\": <secret>, \\"n\\": 1}'),
+        # A key ending a line never takes the next line's frame.
+        ("missing cookie:\n    at renderRows (http://x/assets/index-AAAAAAAA.js:1:2)",
+         "missing cookie:\n    at renderRows (http://x/assets/index-AAAAAAAA.js:1:2)"),
+        ("token:\nnext line", "token:\nnext line"),
+        ("Bearer\n    at renderRowsLongName (x.js:1:2)",
+         "Bearer\n    at renderRowsLongName (x.js:1:2)"),
+        ('password: "never closed and long', "password: <secret>"),
+    ],
+)  # fmt: skip
+def test_scrub_quoted_values_whole_and_never_across_lines(text, expected):
+    assert digest.scrub(text) == expected
+
+
+def test_a_stack_frame_after_a_key_survives_to_the_digest(tree):
+    js = (
+        "TypeError: missing cookie:\n"
+        "    at renderRows (http://192.0.2.10/assets/index-BkX9a1_z.js:12:345)\n"
+    )
+    write_jsonl(
+        tree["server"] / "client-errors.jsonl",
+        [event(NOW - timedelta(hours=1), app="frontend", msg="TypeError: x", exc=js)],
+    )
+    _, report, _ = run(tree)
+    (group,) = report["groups"]
+    assert group["frames"] == ["assets/index.js:12"]
+
+
+@pytest.mark.parametrize(
+    "text", ['password: "' + '\\"' * 8000, '\\"password\\": \\"' + "\\\\" * 8000]
+)
+def test_scrub_of_long_escaped_quotes_is_cheap(text):
+    start = time.perf_counter()
+    digest.scrub(text)
+    assert time.perf_counter() - start < 0.5
