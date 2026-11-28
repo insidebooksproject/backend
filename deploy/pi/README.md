@@ -143,10 +143,12 @@ write it. That step changes nothing on a Pi that already has it.
 
 Since v1.0.23 the backend makes its log files 0640 (and a log directory it
 creates 0750), and the block closes what an older release left open: it
-sets `/srv/ibp/logs` to 0750, owned by `IBP_UID`:`IBP_GID` from `.env`
-(1000:1000 if unset, as `compose.yaml` runs the container), and each
-`*.jsonl*` file in it, rotated copies too, to 0640. Only modes and the
-directory's owner change, never a file's content, so it is safe to run again.
+sets `/srv/ibp/logs` to 0750 and each `*.jsonl*` file in it, rotated copies
+too, to 0640, all owned by `IBP_UID`:`IBP_GID` from `.env` (quotes, spaces
+and a trailing comment are ignored; 1000 if unset or not a number, as
+`compose.yaml` runs the container), so the backend can still write them.
+Only owners and modes change, never a file's content, so it is safe to run
+again. It does this before it stops the shipment timer.
 
 The block stops the shipment timer and holds the sync's run lock while it
 runs, so no sync can start on the new image and migrate the database before
@@ -166,6 +168,21 @@ It keeps the first saved copy of the previous `.env` if it is run again.
         echo "NOT UPGRADED: $saved names ${saved_tag:-no IBP_TAG}, not the version to roll back to; fix it by hand first"
         exit 1
       fi
+      # The error logs: the container's user (IBP_UID/IBP_GID in .env, else
+      # 1000, as compose.yaml has it) owns the directory, closed to other
+      # users, and its files, 0640. Before the timer is stopped, so a
+      # failure here leaves it as it was.
+      env_id() {
+        local value
+        value=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" .env | tail -n 1)
+        value=$(printf '%s' "${value%%#*}" | tr -d "\"' \t\r")
+        case "$value" in '' | *[!0-9]*) value=1000 ;; esac
+        printf '%s\n' "$value"
+      }
+      log_uid=$(env_id IBP_UID)
+      log_gid=$(env_id IBP_GID)
+      sudo install -d -o "$log_uid" -g "$log_gid" -m 0750 /srv/ibp/logs
+      sudo find /srv/ibp/logs -maxdepth 1 -type f -name '*.jsonl*' -exec chown "$log_uid:$log_gid" {} + -exec chmod 0640 {} +
       # No sync may start until the new version is up: one on the new image
       # would migrate the database before the backup. The timer's state is
       # kept, once, to restore it at the end.
@@ -193,12 +210,6 @@ It keeps the first saved copy of the previous `.env` if it is run again.
       flock -n 9 || { echo "NOT UPGRADED: a shipment sync holds its run lock; wait for it to finish and run this block again"; exit 1; }
       "${EDITOR:-nano}" .env                     # new IBP_TAG
       sudo systemctl start ibp-backup.service    # a fresh backup first
-      # The error logs: the container's user (IBP_UID/IBP_GID in .env, else
-      # 1000) owns the directory, closed to other users, and their files.
-      log_uid=$(sed -n 's/^IBP_UID=//p' .env)
-      log_gid=$(sed -n 's/^IBP_GID=//p' .env)
-      sudo install -d -o "${log_uid:-1000}" -g "${log_gid:-1000}" -m 0750 /srv/ibp/logs
-      sudo find /srv/ibp/logs -maxdepth 1 -type f -name '*.jsonl*' -exec chmod 0640 {} +
       docker compose pull
       docker compose up -d
       docker image prune -f

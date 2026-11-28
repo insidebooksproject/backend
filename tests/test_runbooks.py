@@ -530,6 +530,41 @@ def test_upgrade_stops_the_timer_and_restores_its_state(tmp_path, timer, restart
     assert (tmp_path / "probe" / "probe").read_text() == "refused\n"
 
 
+@pytest.mark.parametrize(
+    "env, owner",
+    [
+        ("", "1000 -g 1000"),
+        ("IBP_UID=1001\nIBP_GID=1002\n", "1001 -g 1002"),
+        ('IBP_UID="1001"\nIBP_GID=\'1002\'\n', "1001 -g 1002"),
+        ("  IBP_UID = 1001  # jstarr\r\nIBP_GID=1002\t\n", "1001 -g 1002"),
+        ("IBP_UID=1001\nIBP_UID=1003\n", "1003 -g 1000"),
+        ("IBP_UID=jstarr\nIBP_GID=\n", "1000 -g 1000"),
+    ],
+)
+def test_upgrade_owns_the_logs_as_the_container_before_stopping_the_timer(
+    tmp_path, env, owner
+):
+    """The log directory's owner comes from IBP_UID/IBP_GID as written in
+    any form compose takes (else 1000), and is set before the timer is
+    stopped, so that step failing leaves the timer running."""
+    root = without_upgrade_save(sandbox(tmp_path))
+    dotenv = root / "srv" / "ibp" / ".env"
+    dotenv.write_text(dotenv.read_text() + env)
+    result = run_block(root, upgrade_block())
+    assert result.status == 0, result.output
+    install = f"install -d -o {owner} -m 0750 /srv/ibp/logs"
+    assert install in result.steps
+    stop = result.steps.index("systemctl stop ibp-shipment-sync.timer")
+    assert result.steps.index(install) < stop
+
+    failed = without_upgrade_save(sandbox(tmp_path / "failed"))
+    failed_env = failed / "srv" / "ibp" / ".env"
+    failed_env.write_text(failed_env.read_text() + env)
+    at = result.steps.index(install) + 1
+    steps = run_block(failed, upgrade_block(), at).steps
+    assert not [step for step in steps if step.startswith("systemctl stop")]
+
+
 def backfill_block(readme: str) -> str:
     """The re-evaluation's backfill block (steps 6 and 7)."""
     (block,) = [b for b in code_blocks(readme) if "# 6. Re-evaluate" in b]
