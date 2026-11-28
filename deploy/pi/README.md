@@ -27,7 +27,7 @@ HTTPS.
 | `/srv/ibp/.env` | `IBP_TAG=v…` and the ISBN lookup keys (from `.env.example`; mode 0600) |
 | `/srv/ibp/.env.pre-<tag>`, `compose.yaml.pre-<tag>` | the files as they were before an upgrade replaced them, kept for a rollback |
 | `/srv/ibp/data/data.db` | the database, owned by `jstarr` (uid 1000), in WAL mode |
-| `/srv/ibp/logs/` | the error logs, owned by `jstarr` (uid 1000) like `data/`: `backend.jsonl` (the backend's own WARNING and above) and `client-errors.jsonl` (the browser reports, `POST /api/client-errors`), each rotated at 5 MiB with 4 old files kept. Not under `data/`, so the backups stay the database only |
+| `/srv/ibp/logs/` | the error logs, owned by the container's user (`IBP_UID`:`IBP_GID`, default 1000:1000, `jstarr`) like `data/`, mode 0750, each file 0640 (they can hold inmate data): `backend.jsonl` (the backend's own WARNING and above) and `client-errors.jsonl` (the browser reports, `POST /api/client-errors`), each rotated at 5 MiB with 4 old files kept. Not under `data/`, so the backups stay the database only |
 | `/srv/ibp/data/data.db-wal`, `data.db-shm` | the database's write-ahead log and its index, there while anything has it open: part of the database, so `data.db` is never copied, moved or replaced without them while they exist (see below) |
 | `~/.local/bin/ibp-backup` + timer | backups, see [`scripts/backup/`](../../scripts/backup/README.md) |
 | `~/.local/bin/ibp-label-refund` + timer | unused-label refunds, see [`scripts/label-refund/`](../../scripts/label-refund/README.md) |
@@ -85,7 +85,8 @@ WAL doesn't work over a network filesystem, so `data/` must never be on one
        (
          set -Eeuo pipefail
          trap 'echo "SETUP STOPPED: fix the failed step and run this block again" >&2' ERR
-         sudo install -d -o jstarr -g jstarr /srv/ibp /srv/ibp/data /srv/ibp/logs
+         sudo install -d -o jstarr -g jstarr /srv/ibp /srv/ibp/data
+         sudo install -d -o jstarr -g jstarr -m 0750 /srv/ibp/logs
          # A re-run keeps what an earlier attempt made: the checkout, the
          # edited .env and the database (which the backend may have written).
          [ -d ~/ibp-backend ] || git clone https://github.com/insidebooksproject/backend.git ~/ibp-backend
@@ -140,6 +141,13 @@ container's user (`IBP_UID`, uid 1000, `jstarr`) as `data/` is: if it were
 missing, Docker would create it owned by root and the backend couldn't
 write it. That step changes nothing on a Pi that already has it.
 
+Since v1.0.23 the backend makes its log files 0640 (and a log directory it
+creates 0750), and the block closes what an older release left open: it
+sets `/srv/ibp/logs` to 0750, owned by `IBP_UID`:`IBP_GID` from `.env`
+(1000:1000 if unset, as `compose.yaml` runs the container), and each
+`*.jsonl*` file in it, rotated copies too, to 0640. Only modes and the
+directory's owner change, never a file's content, so it is safe to run again.
+
 The block stops the shipment timer and holds the sync's run lock while it
 runs, so no sync can start on the new image and migrate the database before
 the backup; it starts the timer again at the end if it was running before.
@@ -185,7 +193,12 @@ It keeps the first saved copy of the previous `.env` if it is run again.
       flock -n 9 || { echo "NOT UPGRADED: a shipment sync holds its run lock; wait for it to finish and run this block again"; exit 1; }
       "${EDITOR:-nano}" .env                     # new IBP_TAG
       sudo systemctl start ibp-backup.service    # a fresh backup first
-      sudo install -d -o jstarr -g jstarr -m 0755 /srv/ibp/logs
+      # The error logs: the container's user (IBP_UID/IBP_GID in .env, else
+      # 1000) owns the directory, closed to other users, and their files.
+      log_uid=$(sed -n 's/^IBP_UID=//p' .env)
+      log_gid=$(sed -n 's/^IBP_GID=//p' .env)
+      sudo install -d -o "${log_uid:-1000}" -g "${log_gid:-1000}" -m 0750 /srv/ibp/logs
+      sudo find /srv/ibp/logs -maxdepth 1 -type f -name '*.jsonl*' -exec chmod 0640 {} +
       docker compose pull
       docker compose up -d
       docker image prune -f

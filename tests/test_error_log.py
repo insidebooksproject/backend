@@ -4,11 +4,15 @@
 
 import json
 import logging
+import logging.handlers
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from ibp import base, error_log
@@ -152,3 +156,78 @@ def test_lifespan_starts_without_a_writable_log_dir(
     err = capsys.readouterr().err
     assert "Not writing backend.jsonl" in err
     assert "Not writing client-errors.jsonl" in err
+
+
+def mode(path: Path) -> int:
+    """The permission bits of ``path``."""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+@pytest.fixture
+def no_umask():
+    """A umask of 0, so only the code decides the modes."""
+    old = os.umask(0)
+    yield
+    os.umask(old)
+
+
+def test_backend_log_is_0640_with_its_rotations(
+    tmp_path, monkeypatch, no_umask
+):  # pylint: disable=unused-argument
+    """The file, each new one after a rotation, and a made directory are
+    owner and group only, whatever the umask."""
+    log_dir = tmp_path / "logs"
+    monkeypatch.setenv("IBP_LOG_DIR", str(log_dir))
+    handler, _ = error_log.build_backend_handler()
+    assert isinstance(handler, logging.handlers.RotatingFileHandler)
+    try:
+        handler.maxBytes = 200
+        for _ in range(5):
+            handler.handle(record(msg="x" * 100, args=()))
+    finally:
+        handler.close()
+    files = sorted(log_dir.iterdir())
+    assert [path.name for path in files] == [
+        "backend.jsonl",
+        "backend.jsonl.1",
+        "backend.jsonl.2",
+        "backend.jsonl.3",
+        "backend.jsonl.4",
+    ]
+    assert {mode(path) for path in files} == {0o640}
+    assert mode(log_dir) == 0o750
+
+
+def test_existing_log_file_is_made_0640(
+    tmp_path, monkeypatch, no_umask
+):  # pylint: disable=unused-argument
+    """A file an older release made 0644 is set to 0640 when it is opened."""
+    monkeypatch.setenv("IBP_LOG_DIR", str(tmp_path))
+    path = tmp_path / "backend.jsonl"
+    path.write_text('{"old": 1}\n')
+    path.chmod(0o644)
+    handler, _ = error_log.build_backend_handler()
+    assert handler is not None
+    handler.close()
+    assert mode(path) == 0o640
+    assert path.read_text() == '{"old": 1}\n'
+
+
+def test_engines_hide_parameters():
+    """Database errors (and their tracebacks) leave the values out."""
+    # pylint: disable=import-outside-toplevel
+    from ibp import db
+
+    assert db.build_engine().sync_engine.hide_parameters
+    engine = db.build_sync_engine("sqlite://")
+    assert engine.hide_parameters
+    with engine.connect() as connection:
+        connection.execute(sa.text("CREATE TABLE t (name TEXT UNIQUE)"))
+        connection.execute(sa.text("INSERT INTO t VALUES (:n)"), {"n": "SMITH, JOHN"})
+        with pytest.raises(sa.exc.IntegrityError) as caught:
+            connection.execute(
+                sa.text("INSERT INTO t VALUES (:n)"), {"n": "SMITH, JOHN"}
+            )
+    assert "SMITH" not in str(caught.value)
+    assert "hidden due to hide_parameters" in str(caught.value)
+    assert not db.build_sync_engine("sqlite://", hide_parameters=False).hide_parameters

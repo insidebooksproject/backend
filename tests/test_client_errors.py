@@ -4,7 +4,9 @@
 
 import json
 import logging
+import os
 import re
+import stat
 from pathlib import Path
 
 import pytest
@@ -263,3 +265,15 @@ def test_unwritable_log_dir_falls_back_to_stderr(
     assert response.status_code == 204
     err = capsys.readouterr().err
     assert '"msg": "kept"' in err
+
+
+def test_client_log_file_is_0640(client, log_dir):
+    """The browser reports' file is readable by its owner and group only."""
+    old = os.umask(0)
+    try:
+        assert client.post("/client-errors", json=report()).status_code == 204
+    finally:
+        os.umask(old)
+    path = log_dir / CLIENT_LOG_NAME
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert stat.S_IMODE(log_dir.stat().st_mode) == 0o750

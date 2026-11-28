@@ -12,8 +12,9 @@ writes (see ``docs/error-reporting.md`` in the meta repo, and
 They are written to the log directory, ``[logging] log_dir`` (the
 ``IBP_LOG_DIR`` environment variable; ``/logs`` in the image, mounted from
 ``/srv/ibp/logs`` on the Pi). Each file rotates at 5 MiB and keeps 4 old
-copies. If the directory can't be written, the backend runs without the
-files and says so once on stderr.
+copies. The files are made ``0640`` (rotated copies keep it) and a missing
+directory ``0750``, as they can hold inmate data. If the directory can't be
+written, the backend runs without the files and says so once on stderr.
 """
 
 import datetime
@@ -31,6 +32,8 @@ CLIENT_LOG_NAME = "client-errors.jsonl"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 4
 DEFAULT_LOG_DIR = "logs"
+LOG_FILE_MODE = 0o640
+LOG_DIR_MODE = 0o750
 
 logger = logging.getLogger(__name__)
 
@@ -112,14 +115,34 @@ class EventFormatter(logging.Formatter):
         return json.dumps(getattr(record, "event"), default=repr, ensure_ascii=False)
 
 
+class PrivateRotatingFileHandler(RotatingFileHandler):
+    """A ``RotatingFileHandler`` whose file is ``LOG_FILE_MODE`` (0640).
+
+    Each file it opens, the first and each one after a rotation, is created
+    with that mode whatever the umask, and an existing file it opens is set
+    to it (if it is the owner); a rotated copy is renamed, so keeps it.
+    """
+
+    def _open(self):
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(self.baseFilename, flags, LOG_FILE_MODE)
+        try:
+            os.fchmod(fd, LOG_FILE_MODE)
+        except OSError:  # not the file's owner: leave its mode
+            pass
+        # pylint: disable-next=unspecified-encoding
+        return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+
 def open_log_file(name: str) -> RotatingFileHandler:
-    """A size-rotated handler for ``name`` in the log directory.
+    """A size-rotated handler for ``name`` in the log directory, its file
+    ``0640`` (a missing directory is made ``0750``).
 
     Raises ``OSError`` if the directory can't be made or the file opened.
     """
     log_dir = get_log_dir()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return RotatingFileHandler(
+    log_dir.mkdir(mode=LOG_DIR_MODE, parents=True, exist_ok=True)
+    return PrivateRotatingFileHandler(
         log_dir / name,
         maxBytes=LOG_MAX_BYTES,
         backupCount=LOG_BACKUP_COUNT,

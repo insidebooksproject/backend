@@ -103,7 +103,9 @@ Every IBP app writes its warnings and errors in one JSON-lines event format
 such files to its log directory, `[logging] log_dir` (`IBP_LOG_DIR`; the
 image sets `/logs`, mounted from `/srv/ibp/logs` on the Pi; a dev run uses
 `logs/` in the project directory). Each rotates at 5 MiB and keeps 4 old
-files (`ibp/error_log.py`):
+files (`ibp/error_log.py`). The files are made 0640 (a directory the
+backend creates, 0750), and database errors leave out the statement's
+values (`hide_parameters`), as both can hold inmate data:
 
 - `backend.jsonl`: the backend's own WARNING and above, `app` `backend`.
   The usual log (stderr, for `docker compose logs`) is unchanged.

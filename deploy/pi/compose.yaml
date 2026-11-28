@@ -7,8 +7,8 @@
 #   /srv/ibp/data/data.db   the SQLite database (backed up by ibp-backup)
 #   /srv/ibp/logs/          backend.jsonl and client-errors.jsonl, the error
 #                           logs (not under data/: backups hold the database
-#                           only). Create it, owned like data/, before the
-#                           first start; see README.md (Upgrading).
+#                           only). Create it, owned like data/ and mode 0750,
+#                           before the first start; see README.md (Upgrading).
 
 name: ibp
 

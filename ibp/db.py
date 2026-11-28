@@ -84,20 +84,30 @@ def use_sqlite_pragmas(engine: sa.Engine | AsyncEngine) -> None:
 
 
 def build_sync_engine(url: str, **kwargs: Any) -> sa.Engine:
-    """A synchronous engine on ``url``, with the SQLite pragmas."""
+    """A synchronous engine on ``url``, with the SQLite pragmas.
+
+    Its errors leave the statement's parameters out (``hide_parameters``)
+    unless ``kwargs`` say otherwise: a traceback in the logs must not carry
+    the values a volunteer entered.
+    """
+    kwargs.setdefault("hide_parameters", True)
     engine = sa.create_engine(url, **kwargs)
     use_sqlite_pragmas(engine)
     return engine
 
 
 def build_engine() -> AsyncEngine:
-    """Build an async engine on the configured database."""
+    """Build an async engine on the configured database.
+
+    Its errors leave the statement's parameters out (``hide_parameters``),
+    so a traceback in ``backend.jsonl`` doesn't carry the values sent.
+    """
     uri = config.get("database", "uri")
     parsed = urllib.parse.urlparse(uri)
     mapped_scheme = map_engine_scheme(parsed.scheme)
     uri = uri.replace(f"{parsed.scheme}://", f"{mapped_scheme}://", 1)
     engine_kwargs = get_engine_kwargs(mapped_scheme)
-    engine = create_async_engine(uri, **engine_kwargs)
+    engine = create_async_engine(uri, hide_parameters=True, **engine_kwargs)
     use_sqlite_pragmas(engine)
     return engine
 
