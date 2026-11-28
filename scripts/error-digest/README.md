@@ -75,6 +75,11 @@ no raw path.
    and message shape instead: every
    API call fails in the same response helper, and the frontend's frames
    are minified (their function names are left out of the stack shown).
+   This grouping is new in this release, so every browser group gets a new
+   fingerprint and starts as **new**. There is nothing to migrate:
+   `seen.json` was reset on 2026-11-28 and there are no mutes yet. A later
+   change to a fingerprint must say the same here, or carry the old keys
+   over.
 2. **Status**, from `/var/lib/ibp-error-digest/seen.json` (fingerprint ->
    app, level, first and last seen, weekly counts for 26 weeks; no message
    text): **new** (no earlier week), **growing** (up by half or more on
