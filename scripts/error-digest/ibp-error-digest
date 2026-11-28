@@ -1070,7 +1070,8 @@ def journal_line(
 
 def read_stations(run: Run, root: Path) -> None:
     if not root.is_dir():
-        run.problems.append(f"{root}: not there")
+        # Every station's uploads would be missing, and look "gone".
+        run.fail(f"{root}: not there")
         return
     try:
         with os.scandir(root) as found:
@@ -1092,7 +1093,7 @@ def read_stations(run: Run, root: Path) -> None:
 def read_server_logs(run: Run, folder: Path) -> None:
     """backend.jsonl and client-errors.jsonl (and their rotated copies)."""
     if not folder.is_dir():
-        run.problems.append(f"{folder}: not there (backend before v1.0.22?)")
+        run.fail(f"{folder}: not there (backend before v1.0.22?)")
         return
     station = run.stations.setdefault("ibp-server", Station("ibp-server"))
     margin = run.since - timedelta(days=1)

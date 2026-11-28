@@ -44,7 +44,7 @@ is nested too deep to parse, holds text that can't be written as UTF-8 (an
 escaped lone surrogate), isn't an event (no time stamp, or one outside
 2000-2100), or has a field of a type that trips the reader, is counted as
 unreadable, by file, in the report; no line stops a run. A file or folder
-that can't be opened, listed or read to the end makes the run
+that can't be opened, listed or read to the end, or a missing log folder, makes the run
 **incomplete**: the digest is still written, its first line says
 `(INCOMPLETE: a source could not be read)` and `complete` is `false` in the
 `.json`, the gone groups are listed as "not seen, may not be gone",
@@ -52,8 +52,8 @@ that can't be opened, listed or read to the end makes the run
 groups gone now or growing next week), and the exit status is 1, so
 Healthchecks gets a failure. Only the first
 4000 characters of a message are redacted (and at most 300 kept), and a
-stack's lines are cut to 1000 characters. A folder that isn't there is noted, not
-an error (`/srv/ibp/logs` exists from backend v1.0.22). Files are opened one
+stack's lines are cut to 1000 characters. A missing `/srv/ibp-logs` or `/srv/ibp/logs`
+(which exists from backend v1.0.22) makes the run incomplete too. Files are opened one
 path component at a time below their log folder without following a
 symlink in any of them, and only if they are regular files; a file not
 modified since a day before the week began is not read for events (its

@@ -557,13 +557,24 @@ def test_digest_folder_and_symlinks_are_not_read(tree, tmp_path):
     assert [s["folder"] for s in report["stations"]] == ["IBP_LAPTOP"]
 
 
-def test_missing_folders_still_give_a_digest(tree):
-    tree["root"].rmdir()
-    tree["server"].rmdir()
-    status, report, _ = run(tree)
-    assert status == 0
+@pytest.mark.parametrize("missing", ["root", "server"])
+def test_a_missing_log_folder_makes_the_digest_incomplete(tree, missing):
+    week_of_errors(tree, NOW - timedelta(days=7), 2)
+    run(tree, now=NOW - timedelta(days=7))
+    before = (tree["state"] / "seen.json").read_text()
+    for path in sorted(tree[missing].rglob("*"), reverse=True):
+        if path.is_dir():
+            path.rmdir()
+        else:
+            path.unlink()
+    tree[missing].rmdir()
+    status, report, markdown = run(tree)
+    assert status == 1
+    assert report["complete"] is False
+    assert "(INCOMPLETE: a source could not be read)" in markdown.splitlines()[0]
     assert any("not there" in p for p in report["problems"])
     assert (tree["digest"] / "2026-W48.md").exists()
+    assert (tree["state"] / "seen.json").read_text() == before
 
 
 def usec(moment):
